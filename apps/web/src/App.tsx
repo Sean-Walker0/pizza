@@ -6,9 +6,10 @@ import Layout from "@/components/Layout";
 import AgentView from "@/views/AgentView";
 import SettingsView from "@/views/SettingsView";
 import PluginsView from "@/views/PluginsView";
-import { subscribeSidecarExit, subscribeEvents, initSidecar, sendCommandAwait, listWorkspaces, restartSidecar, stopMainAgent } from "@/lib/transport";
+import { subscribeSidecarExit, subscribeEvents, initSidecar, sendCommandAwait, listWorkspaces, deleteWorkspace, restartSidecar, stopMainAgent, setRpcWorkspace } from "@/lib/transport";
 import { BrandIcon } from "@/components/BrandIcon";
 import { ConfirmHost } from "@/components/ui";
+import { alertDialog } from "@/lib/confirm";
 import type { RpcSessionState, WorkspaceMeta } from "@/lib/types";
 import { isTauri } from "@/lib/utils";
 
@@ -29,11 +30,32 @@ function AppInner() {
 	const [streamingCwds, setStreamingCwds] = useState<Set<string>>(new Set());
 	const [recoveringMainAgent, setRecoveringMainAgent] = useState(false);
 	const sidecarStartedRef = useRef(false);
+	// Last workspace set as the expected rpc response source; used to restore
+	// the snapshot when a workspace switch fails mid-flight.
+	const lastRpcWorkspaceRef = useRef<string | null>(null);
 	// Auto-restart bookkeeping: per-cwd restart count, reset to 0 when a
 	// sidecar becomes ready. Capped at 3 attempts with exponential backoff
 	// to avoid crash loops.
 	const restartCountRef = useRef(0);
 	const restartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	// Monotonic generation for startWithWorkspace runs. When two switches
+	// overlap (user click racing an auto-restart), only the NEWEST run may
+	// commit its workspace — an older in-flight run finishing later would
+	// otherwise overwrite the user's choice (observed as "jumps back to the
+	// previous workspace").
+	const initGenerationRef = useRef(0);
+	// Bumped once per COMPLETED user-visible workspace switch. AgentView keys
+	// its history (re)load on this epoch instead of waitingForWorkspace /
+	// sidecarReady so silent reconnects never reload the conversation.
+	const [switchEpoch, setSwitchEpoch] = useState(0);
+	// A workspace whose project directory vanished (deleted repo, cleaned
+	// /tmp, …). Switching into it can only fail; instead of the full-screen
+	// initError (which hides the sidebar and every recovery path), keep the
+	// UI on the current workspace and offer to remove the stale entry.
+	const [staleCwd, setStaleCwd] = useState<string | null>(null);
+	// Rate limit for silent gateway reconnects (channel drops can arrive in
+	// bursts when the desktop re-attaches several workspaces).
+	const lastReconnectAtRef = useRef(0);
 
 	const refreshWorkspaces = useCallback(async () => {
 		if (!isTauri()) return;
@@ -52,8 +74,30 @@ function AppInner() {
 
 	const [initError, setInitError] = useState<string | null>(null);
 	const startWithWorkspace = useCallback(async (cwd?: string) => {
+		const generation = ++initGenerationRef.current;
+		// True while this run is still the newest switch. A newer switch
+		// (user click, newer restart) must be able to supersede this one —
+		// a stale run must not touch UI state after being superseded.
+		const isCurrent = () => initGenerationRef.current === generation;
 		setWaitingForWorkspace(true);
 		setInitError(null);
+		// Snapshot the expected response source BEFORE initSidecar: the Rust
+		// bridge flips its active-workspace pointer mid-init, so commands issued
+		// in between (e.g. AgentView remounting on navigate("/")) can be routed
+		// to the previous workspace. sendCommandAwait drops responses whose
+		// `_cwd` tag doesn't match this snapshot, so a switch can never render
+		// the old workspace's history/state under the new workspace.
+		let expandedForRpc = cwd;
+		if (cwd && cwd.startsWith("~") && isTauri()) {
+			try {
+				const { homeDir } = await import("@tauri-apps/api/path");
+				const home = await homeDir();
+				expandedForRpc = cwd.replace("~", home);
+			} catch { /* keep ~ */ }
+		}
+		const previousRpcWorkspace = lastRpcWorkspaceRef.current;
+		lastRpcWorkspaceRef.current = expandedForRpc ?? null;
+		setRpcWorkspace(lastRpcWorkspaceRef.current);
 		// Clear stale state from the previous workspace so the UI doesn't
 		// briefly render the old workspace's session/streaming/model info
 		// while the new sidecar's get_state response is in-flight (gateway
@@ -61,6 +105,7 @@ function AppInner() {
 		setState(null);
 		try {
 			const initialState = await initSidecar(cwd);
+			if (!isCurrent()) return; // superseded by a newer switch
 			// Expand ~ to home directory so workspace state matches Rust side.
 			let expandedCwd = cwd;
 			if (cwd && cwd.startsWith("~") && isTauri()) {
@@ -85,19 +130,69 @@ function AppInner() {
 					.catch(() => {});
 			}
 			refreshWorkspaces();
+			// Completed a user-visible switch → let AgentView (re)load history.
+			setSwitchEpoch((e) => e + 1);
 		} catch (e) {
+			if (!isCurrent()) return; // superseded — leave state to the newer run
+			// initSidecar failed — the bridge is still routing to the previous
+			// workspace, so restore its snapshot as the expected response source.
+			lastRpcWorkspaceRef.current = previousRpcWorkspace;
+			setRpcWorkspace(previousRpcWorkspace);
 			const msg = e instanceof Error ? e.message : String(e);
 			console.error("[init] FAILED:", msg);
-			setInitError(msg);
-			// If the directory doesn't exist, refresh workspaces so the stale
-			// entry can be cleaned up by the user.
 			if (msg.includes("does not exist")) {
+				// Missing project directory: NOT a fatal init error — the
+				// previous workspace is still healthy. Offer removing the
+				// stale entry and stay where we are.
+				setInitError(null);
+				setStaleCwd(expandedForRpc ?? cwd ?? null);
 				refreshWorkspaces();
+			} else {
+				setInitError(msg);
 			}
 		} finally {
-			setWaitingForWorkspace(false);
+			if (isCurrent()) setWaitingForWorkspace(false);
 		}
 	}, [refreshWorkspaces]);
+
+	/**
+	 * Silently re-attach the current workspace after a gateway channel drop.
+	 * The pooled agent is still alive server-side — only the channel died —
+	 * so this must NOT flip sidecarReady / waitingForWorkspace / switchEpoch:
+	 * doing so unmounts the conversation and reloads history, which the user
+	 * sees as the app "flickering" and the session "re-initializing". Falls
+	 * back to a full restart (with error surface) when re-attaching fails.
+	 */
+	const reconnectWorkspace = useCallback(async (cwd: string) => {
+		lastReconnectAtRef.current = Date.now();
+		try {
+			const stateFrame = await initSidecar(cwd);
+			if (stateFrame && Object.keys(stateFrame).length > 0) {
+				setState(stateFrame as unknown as RpcSessionState);
+			} else {
+				void sendCommandAwait<RpcSessionState>({ type: "get_state" }, 5000)
+					.then((r) => setState(r.data ?? null))
+					.catch(() => {});
+			}
+			// Channel is healthy again — allow future silent reconnects.
+			restartCountRef.current = 0;
+		} catch (e) {
+			console.warn("[sidecar] silent reconnect failed, falling back to full restart:", e);
+			restartCountRef.current += 1;
+			setSidecarReady(false);
+			if (restartCountRef.current <= 3) {
+				const delay = Math.min(1000 * Math.pow(2, restartCountRef.current - 1), 4000);
+				if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
+				restartTimerRef.current = setTimeout(() => {
+					restartTimerRef.current = null;
+					setWorkspace((current) => {
+						if (current === cwd) void startWithWorkspace(cwd);
+						return current;
+					});
+				}, delay);
+			}
+		}
+	}, [startWithWorkspace]);
 
 	useEffect(() => {
 		if (sidecarStartedRef.current) return;
@@ -172,8 +267,25 @@ function AppInner() {
 		const unlisteners: Array<() => void> = [];
 		(async () => {
 			const un1 = await subscribeSidecarExit((code, cwd) => {
-				// Only mark as not ready if the exited sidecar was the active one.
+				// Only act if the exited sidecar was the active one.
 				if (!cwd || cwd === workspace) {
+					if (code === null) {
+						// Gateway channel drop (bridge emits code:null) — the
+						// agent process is still alive in the gateway pool.
+						// Re-attach silently; no UI reset, no history reload.
+						// Rate-limited: drops can arrive in bursts.
+						const since = Date.now() - lastReconnectAtRef.current;
+						const delay = since < 2000 ? 2000 - since : 0;
+						if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
+						restartTimerRef.current = setTimeout(() => {
+							restartTimerRef.current = null;
+							setWorkspace((current) => {
+								if (current === (cwd ?? workspace)) void reconnectWorkspace(current!);
+								return current;
+							});
+						}, delay);
+						return;
+					}
 					setSidecarExitCode(code);
 					setSidecarReady(false);
 					// Auto-restart with exponential backoff (max 3 attempts).
@@ -246,7 +358,7 @@ function AppInner() {
 			cancelled = true;
 			unlisteners.forEach((fn) => fn());
 		};
-	}, [sidecarReady, workspace, startWithWorkspace]);
+	}, [sidecarReady, workspace, startWithWorkspace, reconnectWorkspace]);
 
 	// Reset the auto-restart counter once a sidecar is healthy, and clean up
 	// any pending restart timer on unmount.
@@ -309,6 +421,53 @@ function AppInner() {
 		if (new URLSearchParams(location.search).get("setup") !== "true") return;
 		navigate("/", { replace: true });
 	}, [state, navigate, location.pathname, location.search]);
+
+	// Stale-workspace dialog: directory missing → offer removal, keep UI.
+	if (staleCwd) {
+		const staleWs = workspaces.find((ws) => ws.cwd === staleCwd);
+		const removeStale = async () => {
+			if (staleWs) {
+				try {
+					await deleteWorkspace(staleWs.workspace_id);
+				} catch (err) {
+					console.error("[workspace] delete stale error:", err);
+					void alertDialog({ title: t("common.error"), message: err instanceof Error ? err.message : String(err), danger: true });
+				}
+			}
+			setStaleCwd(null);
+			refreshWorkspaces();
+		};
+		const p = (
+			<PxlKitSurfaceProvider surface="pixel">
+				<ConfirmHost />
+				<div className="flex h-screen items-center justify-center bg-bg">
+					<div className="flex max-w-lg flex-col items-center gap-4 px-6 text-center">
+						<BrandIcon size={48} className="text-warning" />
+						<p className="font-mono text-sm text-fg">{t("agent.staleWorkspaceTitle")}</p>
+						<p className="max-w-md break-all text-sm leading-6 text-muted">{staleCwd}</p>
+						<p className="text-xs text-muted">{t("agent.staleWorkspaceBody")}</p>
+						<div className="mt-2 flex flex-wrap justify-center gap-3">
+							<button
+								type="button"
+								onClick={() => void removeStale()}
+								className="rounded-md border border-danger bg-danger/15 px-4 py-2 text-sm text-danger transition-colors hover:bg-danger/25"
+							>
+								{t("agent.staleWorkspaceRemove")}
+							</button>
+							<button
+								type="button"
+								onClick={() => setStaleCwd(null)}
+								className="rounded-md border border-border bg-surface-2 px-4 py-2 text-sm text-fg transition-colors hover:bg-surface-2/80"
+							>
+								{t("common.cancel")}
+							</button>
+						</div>
+					</div>
+				</div>
+			</PxlKitSurfaceProvider>
+		);
+		return p;
+	}
 
 	if (initError) {
 		const mainAgentConflict = isMainAgentConflictError(initError);
@@ -419,6 +578,7 @@ function AppInner() {
 				workspace={workspace}
 				workspaces={workspaces}
 				waitingForWorkspace={waitingForWorkspace}
+				switchEpoch={switchEpoch}
 				onRefreshState={refreshState}
 								/>
 							}

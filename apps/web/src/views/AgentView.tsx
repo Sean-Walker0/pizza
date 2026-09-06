@@ -286,6 +286,7 @@ export default function AgentView({
 	workspace,
 	workspaces,
 	waitingForWorkspace,
+	switchEpoch,
 	onRefreshState,
 }: {
 	state: RpcSessionState | null;
@@ -294,6 +295,8 @@ export default function AgentView({
 	workspace?: string | null;
 	workspaces?: import("@/lib/types").WorkspaceMeta[];
 	waitingForWorkspace?: boolean;
+	/** Bumped once per COMPLETED user-visible workspace switch. */
+	switchEpoch?: number;
 	onRefreshState?: () => void;
 }) {
 	const { sidebarCollapsed } = useOutletContext<LayoutOutletContext>() ?? { sidebarCollapsed: false };
@@ -431,8 +434,16 @@ export default function AgentView({
 	}, [workspace]);
 
 	// Load history from sidecar when sidecar becomes ready or workspace changes.
+	// Keyed on switchEpoch (bumped once per completed switch) rather than
+	// waitingForWorkspace/sidecarReady: silent gateway reconnects must NOT
+	// re-run this — reloading the conversation on every channel drop is the
+	// flicker/"session re-initialized" regression. A full crash-restart still
+	// re-runs it via the sidecarReady flip.
 	useEffect(() => {
-		if (!sidecarReady || !workspace) return;
+		// Don't issue workspace-scoped RPCs while a workspace switch is in
+		// flight — the routing target hasn't switched yet and the response
+		// would be the previous workspace's data.
+		if (!sidecarReady || !workspace || waitingForWorkspace) return;
 		// If we already have cached items for this workspace (from a previous
 		// visit this session), don't reload — the save/restore mechanism already
 		// restored them. Otherwise, fetch from sidecar.
@@ -468,7 +479,8 @@ export default function AgentView({
 			}
 		})();
 		return () => { cancelled = true; };
-	}, [sidecarReady, workspace, refreshQueued]);
+		// eslint-disable-next-line react-hooks/exhaustive-deps -- waitingForWorkspace intentionally gates WITHOUT re-triggering: silent reconnects must not reload history
+	}, [sidecarReady, workspace, switchEpoch, refreshQueued]);
 
 	// Track whether the user is pinned to the bottom of the scroll area.
 	// Key insight: we must distinguish "user actively scrolled up" from

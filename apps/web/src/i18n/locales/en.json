@@ -39,6 +39,9 @@
     "statusOffline": "offline",
     "statusRunning": "running",
     "deleteWorkspaceConfirm": "Delete workspace \"{{name}}\"?\nThis removes the workspace metadata. The project files are not affected.",
+    "deleteStaleWorkspaceConfirm": "The directory for workspace \"{{name}}\" no longer exists:\n{{cwd}}\n\nRemove this stale workspace entry?",
+    "staleWorkspaceBadge": "missing",
+    "staleWorkspaceTitle": "Directory missing: {{cwd}}",
     "deleteWorkspaceFailed": "Failed to delete workspace: {{error}}",
     "timeJustNow": "just now",
     "timeMinutesAgo": "{{count}}m ago",
@@ -53,6 +56,9 @@
     "sidecarExited": "Sidecar exited (code {{code}})",
     "agentError": "Agent error ({{reason}})",
     "failedToStartWorkspace": "Failed to start workspace",
+    "staleWorkspaceTitle": "Workspace directory is missing",
+    "staleWorkspaceBody": "The project directory was removed outside of Pizza. You can remove this stale workspace entry — the current workspace is unaffected.",
+    "staleWorkspaceRemove": "Remove stale workspace",
     "mainConflictTitle": "Another main agent is running",
     "mainConflictBody": "An older Pizza main agent is still using ~/.pizza/main. This usually means another window, an older app bundle, or a recently closed process is still alive. Stop the old agent, then restart this window.",
     "stopOldAndRestart": "Stop old agent and restart",
@@ -590,6 +596,18 @@
       "bannerBody": "Pick a provider below and enter your API key to start. No providers are configured yet, so the agent is currently unavailable.",
       "restarting": "Restarting the sidecar to pick up the new key..."
     },
+    "update": {
+      "title": "About & Updates",
+      "currentVersion": "Current version",
+      "latestVersion": "Latest release",
+      "status": "Status",
+      "checking": "Checking…",
+      "checkFailed": "Check failed (offline?)",
+      "available": "Update available: {{version}}",
+      "upToDate": "Up to date",
+      "checkNow": "Check for updates",
+      "download": "Download {{version}}"
+    },
     "scheduler": {
       "title": "Scheduled task defaults",
       "subtitle": "Applied to new tasks. Each task can override per-task.",
@@ -597,6 +615,10 @@
       "defaultConcurrency": "Default concurrency policy",
       "defaultTimeout": "Default per-run timeout"
     }
+  },
+  "update": {
+    "banner": "A new version of Pizza ({{version}}) is available.",
+    "download": "Download"
   },
   "language": {
     "en": "English",
