@@ -4,87 +4,68 @@
  *
  * The Channels tab in the desktop UI saves a config per integration; this
  * module persists those configs (`<agentDir>/channels.json`), spawns one
- * adapter process per ENABLED channel (`@tomsun28/pizza-channel-<type>`), and
- * reports live status back so the UI badge means something real:
+ * adapter process per ENABLED channel (`pizza channel run <id>` — the same
+ * CLI/binary the gateway runs from), and reports live status back so the UI
+ * badge means something real:
  *
  *   UI ──channel_op──▶ gateway ──▶ supervisor ──spawn──▶ adapter process ──tell──▶ gateway (again)
  *
- * The supervisor intentionally reuses the adapters' existing env-var contract
- * (LARK_APP_ID, DISCORD_TOKEN, PIZZA_WORKSPACE, …) — an adapter is a plain
- * node process, so "configured in the UI" and "run by hand" stay identical.
+ * Adapters run out of process on purpose: some patch `https.request` for proxy
+ * support, and a crashing platform SDK must not take the gateway down. The
+ * platform-specific parts (validation, credential probe, the relay itself)
+ * live in packages/channels/<type>.ts.
  */
 
 import { execSync, spawn, type ChildProcess } from "node:child_process";
-import { createServer } from "node:http";
 import { chmodSync, existsSync, mkdirSync, readFileSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { ProxyAgent } from "undici";
+import { channelAdapter, type ChannelConfig } from "../channels/index.js";
+import { resolveCliSpawn } from "../rpc/cli-spawn.js";
 
-export type ManagedChannelType = "discord" | "lark" | "slack" | "telegram" | "webhook";
 export type ManagedChannelStatus = "connected" | "disconnected" | "error" | "configuring";
 
-/** A persisted channel config — mirrors apps/web/src/lib/channels.ts ChannelConfig. */
-export interface ManagedChannelConfig {
-	id: string;
-	type: ManagedChannelType;
-	name: string;
-	enabled: boolean;
-	token?: string;
-	appId?: string;
-	appSecret?: string;
-	/** Slack app-level token for Socket Mode (xapp-…). */
-	appToken?: string;
-	server?: string;
-	channel?: string;
-	webhookUrl?: string;
-	workspace: string;
-}
-
 /** What `list` returns — config + live process state. */
-export interface ManagedChannelInfo extends ManagedChannelConfig {
+export interface ManagedChannelInfo extends ChannelConfig {
 	status: ManagedChannelStatus;
 	lastError?: string;
 	lastMessageAt?: number;
 }
 
 interface RuntimeEntry {
-	config: ManagedChannelConfig;
+	config: ChannelConfig;
 	child?: ChildProcess;
 	/** Set when the adapter failed to spawn or exited. */
 	lastError?: string;
 	/** Rolling stderr/stdout tail — surfaced as lastError context. */
 	tail: string;
+	/** Crash-respawn bookkeeping. */
+	restarts: number;
+	spawnedAt: number;
+	respawnTimer?: NodeJS.Timeout;
 }
 
 const TAIL_LIMIT = 8 * 1024;
+/** Give up respawning after this many rapid crashes; an adapter alive for
+ *  longer than STABLE_MS resets the budget. */
+const RESPAWN_MAX = 5;
+const RESPAWN_DELAY_MS = 5000;
+const STABLE_MS = 60_000;
 
 function newId(): string {
 	return `ch_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
 }
 
-/**
- * Resolve the adapter package's entry point (`dist/index.js`). The channel
- * packages are NOT dependencies of the gateway — they resolve only when
- * installed alongside (monorepo workspaces, or a user-installed package).
- * Returns null when the package can't be resolved.
- */
-function resolveAdapterEntry(type: ManagedChannelType): string | null {
+/** Persisted channel configs (`<agentDir>/channels.json`); [] when missing or unreadable. */
+export function loadChannelConfigs(agentDir: string): ChannelConfig[] {
 	try {
-		const url = import.meta.resolve(`@tomsun28/pizza-channel-${type}`);
-		if (!url.startsWith("file:")) return null;
-		return fileURLToPath(url);
+		const path = join(agentDir, "channels.json");
+		if (!existsSync(path)) return [];
+		const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+		return Array.isArray(parsed) ? (parsed as ChannelConfig[]) : [];
 	} catch {
-		return null;
+		return [];
 	}
-}
-
-/** The node binary to run adapters with. Under a compiled pizza binary
- *  process.execPath IS pizza (can't run a JS file) — fall back to `node`
- *  on PATH; PIZZA_NODE overrides. */
-function nodeBin(): string {
-	if (process.env.PIZZA_NODE) return process.env.PIZZA_NODE;
-	return /node(?:\.exe)?$/i.test(process.execPath) ? process.execPath : "node";
 }
 
 /** systemProxy() returns a URL, `false` for a user-disabled proxy ("off" in
@@ -148,10 +129,10 @@ function systemProxy(agentDir: string): ProxyResolution {
  *  proxy off, so a proxied shell that launched the gateway can't leak through. */
 const PROXY_ENV_VARS = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] as const;
 
-/** Translate a UI config into the adapter's env contract. Exported for tests. */
-export function envFor(config: ManagedChannelConfig, agentDir: string): Record<string, string> {
+/** Env for an adapter process: the gateway's env plus the resolved proxy
+ *  (adapters read HTTPS_PROXY). Exported for tests. */
+export function childEnv(agentDir: string): Record<string, string> {
 	const env: Record<string, string> = { ...(process.env as Record<string, string>) };
-	env.PIZZA_WORKSPACE = config.workspace;
 	const proxy = systemProxy(agentDir);
 	if (proxy === false) {
 		for (const name of PROXY_ENV_VARS) delete env[name];
@@ -161,153 +142,28 @@ export function envFor(config: ManagedChannelConfig, agentDir: string): Record<s
 		env.HTTP_PROXY ??= proxy;
 		env.http_proxy ??= proxy;
 	}
-	// A configured channel/chat becomes a PIZZA_ROUTES entry — same syntax the
-	// adapters accept by hand ("#target=workspace"). Lark chat ids and Discord
-	// channel names both tolerate the leading "#".
-	const route = config.channel?.trim();
-	if (route && config.type !== "webhook") {
-		env.PIZZA_ROUTES = `${route.startsWith("#") ? route : `#${route}`}=${config.workspace}`;
-	}
-	switch (config.type) {
-		case "lark":
-			env.LARK_APP_ID = config.appId ?? "";
-			env.LARK_APP_SECRET = config.appSecret ?? "";
-			break;
-		case "discord":
-			env.DISCORD_TOKEN = config.token ?? "";
-			break;
-		case "telegram":
-			env.TELEGRAM_BOT_TOKEN = config.token ?? "";
-			break;
-		case "slack":
-			env.SLACK_BOT_TOKEN = config.token ?? "";
-			env.SLACK_APP_TOKEN = config.appToken ?? "";
-			break;
-		case "webhook":
-			env.WEBHOOK_TOKEN = config.token ?? "";
-			if (config.webhookUrl) {
-				try {
-					const url = new URL(config.webhookUrl);
-					if (url.port) env.PORT = url.port;
-					if (url.hostname) env.WEBHOOK_HOST = url.hostname;
-				} catch {
-					/* unparsable — keep the adapter defaults */
-				}
-			}
-			break;
-	}
 	return env;
 }
 
 /** Validate a save input. Returns an error string, or null when valid.
  *  Exported for tests. */
-export function validate(input: Partial<ManagedChannelConfig>): string | null {
+export function validate(input: Partial<ChannelConfig>): string | null {
 	if (!input.name?.trim()) return "Display name is required";
 	if (!input.workspace?.trim()) return "Select a workspace";
-	switch (input.type) {
-		case "lark":
-			if (!input.appId?.trim()) return "App ID is required";
-			if (!input.appSecret?.trim()) return "App Secret is required";
-			return null;
-		case "webhook":
-			if (!input.webhookUrl?.trim()) return "Webhook URL is required";
-			return null;
-		case "slack":
-			if (!input.token?.trim()) return "Bot token is required";
-			if (!input.appToken?.trim()) return "App-level token (xapp-…) is required — enable Socket Mode first";
-			return null;
-		case "discord":
-		case "telegram":
-			if (!input.token?.trim()) return "Bot token is required";
-			return null;
-		default:
-			return `Unknown channel type "${String(input.type)}"`;
-	}
+	const adapter = channelAdapter(String(input.type));
+	return adapter ? adapter.validate(input) : `Unknown channel type "${String(input.type)}"`;
 }
 
-/**
- * Real credential check per platform — same call the adapter makes at boot
- * (Lark: tenant_access_token; Discord: users/@me; Telegram: getMe; Slack:
- * auth.test). Webhook is inbound-only: the URL just has to parse.
- */
-async function probeCredentials(
-	config: ManagedChannelConfig,
-	agentDir: string,
-): Promise<{ ok: boolean; message: string }> {
-	// Mirror the adapter's network path — the spawned adapter gets the proxy
-	// via env, the probe (global fetch) gets it via an explicit dispatcher.
+/** Real credential check — delegated to the adapter, through the same proxy
+ *  the spawned adapter gets via env. */
+async function probeCredentials(config: ChannelConfig, agentDir: string): Promise<{ ok: boolean; message: string }> {
+	const adapter = channelAdapter(config.type);
+	if (!adapter) return { ok: false, message: `Unknown channel type "${String(config.type)}"` };
 	const proxy = systemProxy(agentDir);
 	const dispatcher = proxy ? new ProxyAgent(proxy) : undefined;
-	const proxiedFetch = (url: string, init?: RequestInit) =>
-		fetch(url, { ...init, dispatcher } as RequestInit);
+	const proxiedFetch = (url: string, init?: RequestInit) => fetch(url, { ...init, dispatcher } as RequestInit);
 	try {
-		switch (config.type) {
-			case "lark": {
-				const res = await proxiedFetch("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal", {
-					method: "POST",
-					headers: { "content-type": "application/json" },
-					body: JSON.stringify({ app_id: config.appId, app_secret: config.appSecret }),
-					signal: AbortSignal.timeout(10_000),
-				});
-				const body = (await res.json()) as { code?: number; msg?: string };
-				return body.code === 0
-					? { ok: true, message: "App credentials are valid" }
-					: { ok: false, message: `Feishu rejected the credentials: ${body.msg ?? `code ${body.code}`}` };
-			}
-			case "discord": {
-				const res = await proxiedFetch("https://discord.com/api/v10/users/@me", {
-					headers: { authorization: `Bot ${config.token}` },
-					signal: AbortSignal.timeout(10_000),
-				});
-				return res.ok
-					? { ok: true, message: "Bot token is valid" }
-					: { ok: false, message: `Discord rejected the token (HTTP ${res.status})` };
-			}
-			case "telegram": {
-				const res = await proxiedFetch(`https://api.telegram.org/bot${config.token}/getMe`, {
-					signal: AbortSignal.timeout(10_000),
-				});
-				const body = (await res.json()) as { ok?: boolean; description?: string };
-				return body.ok === true
-					? { ok: true, message: "Bot token is valid" }
-					: { ok: false, message: `Telegram rejected the token: ${body.description ?? `HTTP ${res.status}`}` };
-			}
-			case "slack": {
-				const res = await proxiedFetch("https://slack.com/api/auth.test", {
-					method: "POST",
-					headers: { authorization: `Bearer ${config.token}` },
-					signal: AbortSignal.timeout(10_000),
-				});
-				const body = (await res.json()) as { ok?: boolean; error?: string };
-				return body.ok === true
-					? { ok: true, message: "Bot token is valid" }
-					: { ok: false, message: `Slack rejected the token: ${body.error ?? `HTTP ${res.status}`}` };
-			}
-			case "webhook": {
-				// No remote credentials to check — "can we listen" is the test.
-				let url: URL;
-				try {
-					url = new URL(config.webhookUrl ?? "");
-				} catch {
-					return { ok: false, message: "Webhook URL is not a valid URL" };
-				}
-				const port = url.port ? Number(url.port) : 3002;
-				const host = url.hostname || "127.0.0.1";
-				try {
-					await new Promise<void>((resolve, reject) => {
-						const probe = createServer();
-						probe.once("error", reject);
-						probe.listen(port, host, () => probe.close(() => resolve()));
-					});
-					return { ok: true, message: `Webhook will listen on ${host}:${port}` };
-				} catch (err) {
-					if ((err as NodeJS.ErrnoException).code === "EADDRINUSE") {
-						return { ok: true, message: `${host}:${port} is already listening` };
-					}
-					return { ok: false, message: `Cannot listen on ${host}:${port}: ${err instanceof Error ? err.message : String(err)}` };
-				}
-			}
-		}
+		return await adapter.probe(config, proxiedFetch);
 	} catch (error) {
 		return { ok: false, message: `Connectivity check failed: ${error instanceof Error ? error.message : String(error)}` };
 	}
@@ -319,6 +175,7 @@ export class ChannelSupervisor {
 	private readonly entries = new Map<string, RuntimeEntry>();
 	private settingsWatcher?: FSWatcher;
 	private respawnTimer?: NodeJS.Timeout;
+	private shuttingDown = false;
 
 	constructor(agentDir: string) {
 		this.agentDir = agentDir;
@@ -327,8 +184,8 @@ export class ChannelSupervisor {
 
 	/** Load persisted configs and spawn every enabled channel. Call at gateway start. */
 	start(): void {
-		for (const config of this.load()) {
-			this.entries.set(config.id, { config, tail: "" });
+		for (const config of loadChannelConfigs(this.agentDir)) {
+			this.entries.set(config.id, { config, tail: "", restarts: 0, spawnedAt: 0 });
 		}
 		for (const entry of this.entries.values()) {
 			if (entry.config.enabled) this.spawn(entry);
@@ -354,20 +211,11 @@ export class ChannelSupervisor {
 
 	/** Stop every adapter process. Call at gateway shutdown. */
 	async shutdown(): Promise<void> {
+		this.shuttingDown = true;
 		this.settingsWatcher?.close();
 		clearTimeout(this.respawnTimer);
 		for (const entry of this.entries.values()) {
 			this.stop(entry);
-		}
-	}
-
-	private load(): ManagedChannelConfig[] {
-		try {
-			if (!existsSync(this.configPath)) return [];
-			const parsed = JSON.parse(readFileSync(this.configPath, "utf8")) as unknown;
-			return Array.isArray(parsed) ? (parsed as ManagedChannelConfig[]) : [];
-		} catch {
-			return [];
 		}
 	}
 
@@ -401,18 +249,16 @@ export class ChannelSupervisor {
 
 	private spawn(entry: RuntimeEntry): void {
 		this.stop(entry);
-		const { config } = entry;
-		const entryPoint = resolveAdapterEntry(config.type);
-		if (!entryPoint) {
-			entry.lastError = `Adapter package "@tomsun28/pizza-channel-${config.type}" is not installed`;
-			return;
-		}
 		entry.lastError = undefined;
 		entry.tail = "";
+		entry.spawnedAt = Date.now();
+		// Re-run the CLI we're running from: `node cli.js …` or the compiled binary.
+		const { cliPath, binary } = resolveCliSpawn();
+		const args = ["channel", "run", entry.config.id, "--agent-dir", this.agentDir];
 		let child: ChildProcess;
 		try {
-			child = spawn(nodeBin(), [entryPoint], {
-				env: envFor(config, this.agentDir),
+			child = spawn(binary ? cliPath : process.execPath, binary ? args : [cliPath, ...args], {
+				env: childEnv(this.agentDir),
 				stdio: ["ignore", "pipe", "pipe"],
 			});
 		} catch (error) {
@@ -433,6 +279,7 @@ export class ChannelSupervisor {
 			const reason = signal ? `signal ${signal}` : `code ${code}`;
 			if (crashed && entry.config.enabled && code !== 0) {
 				entry.lastError = `adapter exited (${reason})${entry.tail.trim() ? `: ${entry.tail.trim().slice(-400)}` : ""}`;
+				this.scheduleRespawn(entry);
 			}
 		});
 		child.on("error", (error) => {
@@ -440,7 +287,22 @@ export class ChannelSupervisor {
 		});
 	}
 
+	/** Retry a crashed adapter — e.g. a port freed when a stale duplicate
+	 *  dies. An adapter that stayed up for STABLE_MS gets a fresh budget; a
+	 *  rapid crash loop gives up after RESPAWN_MAX attempts. */
+	private scheduleRespawn(entry: RuntimeEntry): void {
+		entry.restarts = Date.now() - entry.spawnedAt > STABLE_MS ? 1 : entry.restarts + 1;
+		if (this.shuttingDown || entry.restarts > RESPAWN_MAX) return;
+		entry.respawnTimer = setTimeout(() => {
+			entry.respawnTimer = undefined;
+			if (this.shuttingDown || !entry.config.enabled || entry.child) return;
+			this.spawn(entry);
+		}, RESPAWN_DELAY_MS);
+	}
+
 	private stop(entry: RuntimeEntry): void {
+		clearTimeout(entry.respawnTimer);
+		entry.respawnTimer = undefined;
 		const child = entry.child;
 		entry.child = undefined;
 		if (child && child.exitCode === null && !child.killed) {
@@ -453,14 +315,14 @@ export class ChannelSupervisor {
 	}
 
 	/** Create or update a config, persist, and (re)spawn when enabled. */
-	save(input: Partial<ManagedChannelConfig>, id?: string): ManagedChannelInfo {
+	save(input: Partial<ChannelConfig>, id?: string): ManagedChannelInfo {
 		const err = validate(input);
 		if (err) throw new Error(err);
 		const existing = id ? this.entries.get(id) : undefined;
 		if (id && !existing) throw new Error(`Channel "${id}" not found`);
-		const config: ManagedChannelConfig = {
+		const config: ChannelConfig = {
 			id: existing?.config.id ?? newId(),
-			type: input.type as ManagedChannelType,
+			type: input.type as ChannelConfig["type"],
 			name: input.name!.trim(),
 			enabled: input.enabled ?? true,
 			token: input.token,
@@ -472,10 +334,11 @@ export class ChannelSupervisor {
 			webhookUrl: input.webhookUrl,
 			workspace: input.workspace!.trim(),
 		};
-		const entry: RuntimeEntry = existing ?? { config, tail: "" };
+		const entry: RuntimeEntry = existing ?? { config, tail: "", restarts: 0, spawnedAt: 0 };
 		entry.config = config;
 		this.entries.set(config.id, entry);
 		this.persist();
+		entry.restarts = 0;
 		if (config.enabled) this.spawn(entry);
 		else this.stop(entry);
 		return this.toInfo(entry);
@@ -494,6 +357,7 @@ export class ChannelSupervisor {
 		if (!entry) throw new Error(`Channel "${id}" not found`);
 		entry.config = { ...entry.config, enabled };
 		this.persist();
+		entry.restarts = 0;
 		if (enabled) this.spawn(entry);
 		else this.stop(entry);
 		return this.toInfo(entry);

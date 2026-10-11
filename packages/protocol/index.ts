@@ -241,7 +241,8 @@ export type RpcCommand =
 	// Model
 	| { id?: string; type: "set_model"; provider: string; modelId: string }
 	| { id?: string; type: "cycle_model" }
-	| { id?: string; type: "get_available_models" }
+	/** authOnly: return only models with configured auth (the registry holds ~1.6k models, ~260KB). */
+	| { id?: string; type: "get_available_models"; authOnly?: boolean }
 
 	// Thinking
 	| { id?: string; type: "set_thinking_level"; level: ThinkingLevel }
@@ -299,11 +300,13 @@ export type RpcCommand =
 	| { id?: string; type: "get_skills" }
 	| { id?: string; type: "set_skill_enabled"; skillName: string; enabled: boolean }
 	| { id?: string; type: "delete_skill"; skillName: string }
+	| { id?: string; type: "install_skill"; source: string; slug: string }
 	| { id?: string; type: "get_extensions" }
 	| { id?: string; type: "get_themes" }
 	| { id?: string; type: "set_extension_enabled"; extensionId: string; enabled: boolean }
 	| { id?: string; type: "install_extension"; extensionId: string }
 	| { id?: string; type: "uninstall_extension"; extensionId: string }
+	| { id?: string; type: "install_package"; source: string }
 	| { id?: string; type: "remove_package"; source: string }
 	| { id?: string; type: "get_extension_permissions"; extensionId: string }
 	| { id?: string; type: "recheck_extension_permissions"; extensionId: string }
@@ -402,8 +405,14 @@ export interface RpcExtensionInfo {
 	kind: "builtin" | "user" | "project" | "cli" | "package";
 	/** Whether the extension is currently active (loaded). Disabled built-ins report false. */
 	enabled: boolean;
-	/** Whether toggling enable/disable is supported (currently only built-in extensions). */
+	/** Whether toggling enable/disable is supported (built-ins and installed plugin packages). */
 	canToggle: boolean;
+	/**
+	 * For extensions from an installed plugin package: the package source. Pass
+	 * it (not `id`) to set_extension_enabled / remove_package — packages toggle
+	 * and uninstall as a whole.
+	 */
+	packageSource?: string;
 	/** Whether this extension ships an external dependency (e.g. a CLI binary) that can be installed/uninstalled. */
 	installable: boolean;
 	/** Whether the external dependency is currently installed. Only meaningful when installable is true. */
@@ -416,6 +425,12 @@ export interface RpcExtensionInfo {
 	commandCount: number;
 	/** Number of dynamic built-in cli commands this extension registers (e.g. computer-use's `_computer_use`). */
 	builtinCommandCount: number;
+	/**
+	 * For package extensions: extension load errors attributed to this package
+	 * (e.g. a pi-marketplace package importing APIs the runtime doesn't have).
+	 * Absent when the package loaded cleanly.
+	 */
+	loadError?: string;
 }
 
 /** A theme known to the agent (built-in, user dir, or extension-contributed), as returned by get_themes. */
@@ -542,7 +557,7 @@ export type RpcResponse =
 	// Model
 	| { id?: string; type: "response"; command: "set_model"; success: true; data: ModelInfo }
 	| { id?: string; type: "response"; command: "cycle_model"; success: true; data: { model: ModelInfo; thinkingLevel: ThinkingLevel; isScoped: boolean } | null }
-	| { id?: string; type: "response"; command: "get_available_models"; success: true; data: { models: ModelInfo[] } }
+	| { id?: string; type: "response"; command: "get_available_models"; success: true; data: { models: ModelInfo[]; total: number } }
 
 	// Thinking
 	| { id?: string; type: "response"; command: "set_thinking_level"; success: true }
@@ -600,11 +615,13 @@ export type RpcResponse =
 			data: { name: string; enabled: boolean; requiresReload: boolean };
 	  }
 	| { id?: string; type: "response"; command: "delete_skill"; success: true; data: { name: string } }
+	| { id?: string; type: "response"; command: "install_skill"; success: true; data: { name: string; path: string } }
 	| { id?: string; type: "response"; command: "get_extensions"; success: true; data: { extensions: RpcExtensionInfo[] } }
 	| { id?: string; type: "response"; command: "get_themes"; success: true; data: { themes: RpcThemeInfo[] } }
 	| { id?: string; type: "response"; command: "set_extension_enabled"; success: true; data: { id: string; enabled: boolean; requiresReload: boolean } }
 	| { id?: string; type: "response"; command: "install_extension"; success: true; data: { extensionId: string; ok: boolean; message: string; installed: boolean } }
 	| { id?: string; type: "response"; command: "uninstall_extension"; success: true; data: { extensionId: string; ok: boolean; message: string; installed: boolean } }
+	| { id?: string; type: "response"; command: "install_package"; success: true; data: { source: string; installed: boolean; requiresReload: boolean } }
 	| { id?: string; type: "response"; command: "remove_package"; success: true; data: { source: string; removed: boolean; requiresReload: boolean } }
 	| { id?: string; type: "response"; command: "get_extension_permissions"; success: true; data: RpcExtensionPermissionState }
 	| { id?: string; type: "response"; command: "recheck_extension_permissions"; success: true; data: RpcExtensionPermissionState }

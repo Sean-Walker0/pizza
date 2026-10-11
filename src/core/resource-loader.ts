@@ -28,6 +28,7 @@ import {
 	getBuiltinSkillInfos,
 	getBuiltinSkillPath,
 	getEnabledBuiltinSkillPaths,
+	isBuiltinSkillEnabled,
 } from "../builtin-skills/index.js";
 
 export interface ResourceExtensionPaths {
@@ -54,9 +55,11 @@ export interface ResourceLoader {
 	/** Every known skill with its enabled state (built-in skills included). */
 	getSkillCatalog?(): SkillCatalogEntry[];
 	/**
-	 * Enable or disable a skill by name and re-load skills. Built-in skills are
-	 * toggled through the `enabledBuiltinSkills` allowlist, discovered skills
-	 * through the `disabledSkills` denylist. Returns false for unknown names.
+	 * Enable or disable a skill by name and re-load skills. Opt-in built-in
+	 * skills are toggled through the `enabledBuiltinSkills` allowlist,
+	 * `enabledByDefault` built-ins through the `disabledBuiltinSkills`
+	 * denylist, and discovered skills through the `disabledSkills` denylist.
+	 * Returns false for unknown names.
 	 */
 	setSkillEnabled?(name: string, enabled: boolean): boolean;
 	/**
@@ -66,12 +69,18 @@ export interface ResourceLoader {
 	 * (returns false), as are unknown names.
 	 */
 	deleteSkill?(name: string): boolean;
+	/** The user-scope skills directory (`~/.agents/skills`) — where marketplace installs go. */
+	getUserSkillsDir?(): string;
 	getPrompts(): { prompts: PromptTemplate[]; diagnostics: ResourceDiagnostic[] };
 	getThemes(): { themes: Theme[]; diagnostics: ResourceDiagnostic[] };
 	/** Installed plugin packages configured in settings (may contribute any resource type). */
 	listConfiguredPackages?(): ConfiguredPackage[];
-	/** Remove an installed package (files for npm/git) and drop it from settings. Returns false when not configured. */
+	/** Install a plugin package (npm/git/local source) and persist it to extensions.json. */
+	installConfiguredPackage?(source: string): Promise<void>;
+	/** Remove an installed package (files for npm/git) and drop its extensions.json record. Returns false when not installed. */
 	removeConfiguredPackage?(source: string): Promise<boolean>;
+	/** Enable/disable an installed package (takes effect on the next resource reload). Returns false when not installed. */
+	setConfiguredPackageEnabled?(source: string, enabled: boolean): boolean;
 	getAgentsFiles(): { agentsFiles: Array<{ path: string; content: string }> };
 	getSystemPrompt(): string | undefined;
 	getAppendSystemPrompt(): string[];
@@ -189,7 +198,7 @@ export interface DefaultResourceLoaderOptions {
 	noExtensions?: boolean;
 	/** Skip loading built-in extensions (agent-browser, …). Default: false. */
 	noBuiltinExtensions?: boolean;
-	/** Skip loading built-in skills entirely (they are disabled by default anyway). Default: false. */
+	/** Skip loading built-in skills entirely. Default: false. */
 	noBuiltinSkills?: boolean;
 	noSkills?: boolean;
 	noPromptTemplates?: boolean;
@@ -285,6 +294,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private extensionThemeSourceInfos: Map<string, SourceInfo>;
 	private lastPromptPaths: string[];
 	private lastThemePaths: string[];
+	private reloadQueue: Promise<void> = Promise.resolve();
 
 	constructor(options: DefaultResourceLoaderOptions) {
 		this.cwd = options.cwd;
@@ -365,16 +375,29 @@ export class DefaultResourceLoader implements ResourceLoader {
 		return this.packageManager.listConfiguredPackages();
 	}
 
+	async installConfiguredPackage(source: string): Promise<void> {
+		await this.packageManager.installAndPersist(source);
+	}
+
 	async removeConfiguredPackage(source: string): Promise<boolean> {
+		const effectiveSource = this.effectivePackageSource(source);
+		return effectiveSource !== undefined && this.packageManager.removeAndPersist(effectiveSource);
+	}
+
+	setConfiguredPackageEnabled(source: string, enabled: boolean): boolean {
+		const effectiveSource = this.effectivePackageSource(source);
+		return effectiveSource !== undefined && this.packageManager.setPackageEnabled(effectiveSource, enabled);
+	}
+
+	/** The source to hand back to the package manager for an installed package id, or undefined when not installed. */
+	private effectivePackageSource(source: string): string | undefined {
 		const configured = this.packageManager.listConfiguredPackages().find((p) => p.source === source);
-		if (!configured) return false;
-		// Settings store local sources as paths relative to the agent/project
-		// dir — feeding them back verbatim would resolve against the process
-		// cwd and miss. installedPath is already resolved against the right
-		// base dir, so pass that instead.
+		if (!configured) return undefined;
+		// Local sources are stored relative to the agent dir — feeding them back
+		// verbatim would resolve against the process cwd and miss. installedPath
+		// is already resolved against the right base dir, so pass that instead.
 		const isLocalSource = isLocalPath(source) || source.startsWith("file:");
-		const effectiveSource = isLocalSource && configured.installedPath ? configured.installedPath : source;
-		return this.packageManager.removeAndPersist(effectiveSource, { local: configured.scope === "project" });
+		return isLocalSource && configured.installedPath ? configured.installedPath : source;
 	}
 
 	getAgentsFiles(): { agentsFiles: Array<{ path: string; content: string }> } {
@@ -456,7 +479,23 @@ export class DefaultResourceLoader implements ResourceLoader {
 		}
 	}
 
+	/**
+	 * Serialize full reloads. Overlapping callers each need a snapshot taken
+	 * after their triggering change — joining a scan that started earlier could
+	 * hand back a stale catalog, so reloads queue instead of sharing results.
+	 */
 	async reload(): Promise<void> {
+		const run = this.reloadQueue.then(() => this.performReload());
+		this.reloadQueue = run.catch(() => {});
+		return run;
+	}
+
+	private async performReload(): Promise<void> {
+		// Snapshot skill-source dir mtimes up front: the catalog built below is
+		// what the fingerprint will describe. A folder change landing mid-scan
+		// keeps this snapshot stale, so a later refreshSkillsIfChanged still
+		// detects it instead of recording a fresh fingerprint over a stale catalog.
+		const dirFingerprintBefore = this.skillSourceDirFingerprint();
 		await this.settingsManager.reload();
 		const resolvedPaths = await this.packageManager.resolve();
 		const cliExtensionPaths = await this.packageManager.resolveExtensionSources(this.additionalExtensionPaths, {
@@ -539,7 +578,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 		extensionsResult.errors.push(...inlineExtensions.errors);
 
 		// Load built-in extensions. They are always present unless disabled in
-		// settings (disabledBuiltinExtensions) or this loader opts out entirely
+		// extensions.json (ExtensionRegistry) or this loader opts out entirely
 		// (noBuiltinExtensions, e.g. for tests or an explicit --no-builtin-extensions).
 		if (!this.noBuiltinExtensions) {
 			const disabledBuiltins = this.settingsManager.getDisabledBuiltinExtensions();
@@ -626,7 +665,9 @@ export class DefaultResourceLoader implements ResourceLoader {
 			: baseAppend;
 
 		this.loadMainAgentResources();
-		this.lastSkillSourceFingerprint = this.computeSkillSourceFingerprint();
+		// Dir part from the pre-scan snapshot; file part describes the paths
+		// this catalog was just built from.
+		this.lastSkillSourceFingerprint = `${dirFingerprintBefore}|${this.skillFileFingerprint()}`;
 	}
 
 	private normalizeExtensionPaths(
@@ -664,7 +705,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 			getBuiltinSkillIds().map((id) => [getBuiltinSkillPath(id), id] as const),
 		);
 		// Discovered skills are enabled unless denylisted; built-in skills only
-		// reach this point when their allowlist entry is set, so they are enabled.
+		// reach this point when effectively enabled, so they are enabled.
 		const disabledNames = this.settingsManager.getDisabledSkills();
 		const catalog: SkillCatalogEntry[] = loaded.map((skill) => {
 			const builtinId = builtinIdsByPath.get(skill.filePath);
@@ -693,8 +734,9 @@ export class DefaultResourceLoader implements ResourceLoader {
 			return [];
 		}
 		const enabledIds = this.settingsManager.getEnabledBuiltinSkills();
+		const disabledIds = this.settingsManager.getDisabledBuiltinSkills();
 		return getBuiltinSkillInfos()
-			.filter((info) => !enabledIds.has(info.id))
+			.filter((info) => !isBuiltinSkillEnabled(info.id, enabledIds, disabledIds))
 			.map((info) => ({
 				enabled: false,
 				builtinId: info.id,
@@ -715,9 +757,11 @@ export class DefaultResourceLoader implements ResourceLoader {
 	}
 
 	/**
-	 * Toggle a skill by name. Built-in skills are opt-in (allowlist), discovered
-	 * skills are opt-out (denylist); either way the change is persisted to user
-	 * settings and skills are re-loaded so the caller can rebuild its prompt.
+	 * Toggle a skill by name. Opt-in built-in skills use the allowlist,
+	 * enabled-by-default built-ins the `disabledBuiltinSkills` denylist,
+	 * discovered skills the `disabledSkills` denylist; either way the change is
+	 * persisted to user settings and skills are re-loaded so the caller can
+	 * rebuild its prompt.
 	 */
 	setSkillEnabled(name: string, enabled: boolean): boolean {
 		const entry = this.skillCatalog.find((candidate) => candidate.skill.name === name);
@@ -741,6 +785,14 @@ export class DefaultResourceLoader implements ResourceLoader {
 	 * runtime, and skills living outside the default user/project skill
 	 * directories (those are managed via settings paths, not files).
 	 */
+	/**
+	 * The user-scope skills directory where new skills are installed: the shared
+	 * `~/.agents/skills` convention dir, which the loader already auto-discovers.
+	 */
+	getUserSkillsDir(): string {
+		return join(homedir(), ".agents", "skills");
+	}
+
 	deleteSkill(name: string): boolean {
 		const entry = this.skillCatalog.find((candidate) => candidate.skill.name === name);
 		if (!entry || entry.builtinId !== undefined) {
@@ -755,6 +807,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 		const allowedRoots = [
 			resolve(join(this.agentDir, "skills")),
 			resolve(join(this.cwd, CONFIG_DIR_NAME, "skills")),
+			resolve(this.getUserSkillsDir()),
 		];
 		if (!allowedRoots.some((root) => this.isUnderPath(filePath, root))) {
 			return false;
@@ -778,14 +831,18 @@ export class DefaultResourceLoader implements ResourceLoader {
 	}
 
 	/**
-	 * SKILL.md paths of the built-in skills currently enabled in settings.
-	 * Built-in skills are disabled by default (`enabledBuiltinSkills` allowlist).
+	 * SKILL.md paths of the built-in skills effectively enabled in settings
+	 * (`enabledBuiltinSkills` allowlist + `enabledByDefault` skills not in the
+	 * `disabledBuiltinSkills` denylist).
 	 */
 	private getBuiltinSkillPaths(): string[] {
 		if (this.noSkills || this.noBuiltinSkills) {
 			return [];
 		}
-		const paths = getEnabledBuiltinSkillPaths(this.settingsManager.getEnabledBuiltinSkills());
+		const paths = getEnabledBuiltinSkillPaths(
+			this.settingsManager.getEnabledBuiltinSkills(),
+			this.settingsManager.getDisabledBuiltinSkills(),
+		);
 		for (const path of paths) {
 			// Register source attribution so these show up as `builtin` (persisted map,
 			// unlike the per-reload metadataByPath).
@@ -815,6 +872,16 @@ export class DefaultResourceLoader implements ResourceLoader {
 	 * file (so in-place edits are detected too).
 	 */
 	private computeSkillSourceFingerprint(): string {
+		return `${this.skillSourceDirFingerprint()}|${this.skillFileFingerprint()}`;
+	}
+
+	/**
+	 * Directory part: entry names plus mtime. Child names are needed because
+	 * mtime alone is unreliable — e.g. `fs.cp` on APFS creates the destination
+	 * via clonefile without bumping the parent dir mtime, so a freshly
+	 * installed skill folder can slip past an mtime-only check.
+	 */
+	private skillSourceDirFingerprint(): string {
 		const userAgentsSkillsDir = join(homedir(), ".agents", "skills");
 		const dirs = [
 			join(this.agentDir, "skills"),
@@ -827,11 +894,18 @@ export class DefaultResourceLoader implements ResourceLoader {
 		const parts: string[] = [];
 		for (const dir of dirs) {
 			try {
-				parts.push(`${dir}:${statSync(dir).mtimeMs}`);
+				const children = readdirSync(dir).sort().join(",");
+				parts.push(`${dir}:${statSync(dir).mtimeMs}:${children}`);
 			} catch {
 				parts.push(`${dir}:-`);
 			}
 		}
+		return parts.join("|");
+	}
+
+	/** Skill-file mtime part: catches in-place edits of known skill files. */
+	private skillFileFingerprint(): string {
+		const parts: string[] = [];
 		for (const p of this.lastSkillPaths) {
 			try {
 				parts.push(`${p}:${statSync(p).mtimeMs}`);
@@ -846,11 +920,15 @@ export class DefaultResourceLoader implements ResourceLoader {
 		if (this.noSkills) {
 			return false;
 		}
-		if (this.computeSkillSourceFingerprint() === this.lastSkillSourceFingerprint) {
-			return false;
+		let changed = false;
+		// Re-check after each reload: a change can land while a scan is queued
+		// or in flight, leaving the fingerprint stale again. Bounded so a
+		// perpetually-mutating directory can't spin forever.
+		for (let i = 0; i < 3 && this.computeSkillSourceFingerprint() !== this.lastSkillSourceFingerprint; i++) {
+			await this.reload();
+			changed = true;
 		}
-		await this.reload();
-		return true;
+		return changed;
 	}
 
 	private updatePromptsFromPaths(promptPaths: string[], metadataByPath?: Map<string, PathMetadata>): void {

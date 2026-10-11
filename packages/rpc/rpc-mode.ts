@@ -13,7 +13,7 @@
 
 import * as crypto from "node:crypto";
 import { readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import type { AgentMessage } from "../../src/core/agent/types.js";
 import { computeMessageStats, type SessionStats } from "../../src/core/session-stats.js";
 import type {
@@ -32,8 +32,10 @@ import {
 	getBuiltinExtensionInfo,
 	getBuiltinExtensionInfos,
 	getBuiltinExtensionLifecycle,
+	getBuiltinInstallState,
 } from "../../src/builtin-extensions/index.js";
 import { exportFromFile } from "../../src/core/export-html/index.js";
+import { installSkillFromGitHub } from "../../src/core/skill-install.js";
 import { buildHistoryTreeNodes } from "../../src/core/projection/history-tree.js";
 import { killTrackedDetachedChildren } from "../../src/utils/shell.js";
 import { startPtyServer, type PtyServer } from "../pty/pty-server.js";
@@ -273,21 +275,33 @@ async function refreshSkillsFromDisk(facade: SessionFacade): Promise<void> {
 async function buildExtensionInfos(facade: SessionFacade): Promise<RpcExtensionInfo[]> {
 	const infos: RpcExtensionInfo[] = [];
 	const loadedIds = new Set<string>();
-	const loaded = facade.resourceLoader?.getExtensions().extensions ?? [];
+	const extensionsResult = facade.resourceLoader?.getExtensions();
+	const loaded = extensionsResult?.extensions ?? [];
 	const cwd = facade.runtime?.cwd ?? process.cwd();
 
-	// Resolve install state (installed?) for every installable built-in up front,
-	// concurrently. Best-effort: a failed check defaults to "not installed".
+	// Map extension load errors back to the package that produced them (error
+	// paths live under the package's installed dir) so the UI can flag a
+	// package that partially or fully failed to load — e.g. a pi-marketplace
+	// package importing APIs pizza doesn't provide.
+	const packages = facade.resourceLoader?.listConfiguredPackages?.() ?? [];
+	const packageLoadErrors = new Map<string, string>();
+	for (const pkg of packages) {
+		if (!pkg.installedPath) continue;
+		for (const err of extensionsResult?.errors ?? []) {
+			const rel = relative(pkg.installedPath, err.path);
+			if (rel && !rel.startsWith("..") && !isAbsolute(rel)) {
+				const prev = packageLoadErrors.get(pkg.source);
+				packageLoadErrors.set(pkg.source, prev ? `${prev}\n${err.error}` : err.error);
+			}
+		}
+	}
+
+	// Installed state of every built-in, read from extensions.json — no probing.
+	const registry = facade.settingsManager.extensions;
 	const installState = new Map<string, { installed: boolean; version?: string }>();
 	await Promise.all(
 		getBuiltinExtensionInfos().map(async (info) => {
-			const lc = getBuiltinExtensionLifecycle(info.id);
-			if (!lc?.installable || !lc.checkInstalled) return;
-			try {
-				installState.set(info.id, await lc.checkInstalled(cwd));
-			} catch {
-				installState.set(info.id, { installed: false });
-			}
+			installState.set(info.id, await getBuiltinInstallState(registry, info.id, cwd));
 		}),
 	);
 
@@ -298,24 +312,29 @@ async function buildExtensionInfos(facade: SessionFacade): Promise<RpcExtensionI
 		loadedIds.add(id);
 		const builtin = getBuiltinExtensionInfo(id);
 		const installable = installableFor(id);
+		const kind = extensionKind(ext);
+		// Package extensions toggle as a whole package (by its source).
+		const packageSource = kind === "package" ? ext.sourceInfo.source : undefined;
 		infos.push({
 			id,
 			name: builtin?.name ?? id,
 			description: builtin?.description,
-			kind: extensionKind(ext),
+			kind,
 			enabled: true,
-			canToggle: Boolean(builtin),
+			canToggle: Boolean(builtin) || packageSource !== undefined,
+			packageSource,
 			installable,
 			installed: installable ? (installState.get(id)?.installed ?? false) : true,
 			path: ext.path,
 			toolCount: ext.tools.size,
 			commandCount: ext.commands.size,
 			builtinCommandCount: ext.builtinCommands?.size ?? 0,
+			loadError: packageSource ? packageLoadErrors.get(packageSource) : undefined,
 		});
 	}
 
 	// Built-ins that are not currently loaded. A built-in shows as disabled only
-	// when the user has explicitly disabled it (settings.disabledBuiltinExtensions);
+	// when the user has explicitly disabled it (extensions.json);
 	// otherwise it is considered enabled even if this facade has no resource loader
 	// (e.g. minimal/embedded sessions).
 	const disabledBuiltins = facade.settingsManager.getDisabledBuiltinExtensions();
@@ -338,12 +357,13 @@ async function buildExtensionInfos(facade: SessionFacade): Promise<RpcExtensionI
 		});
 	}
 
-	// Installed packages that contribute only non-extension resources (theme/
-	// skill/prompt packs) still deserve a row so users can see and manage them.
+	// Installed packages without a loaded extension: disabled ones, and packs
+	// that contribute only themes/skills/prompts. They still get a row so users
+	// can see, re-enable and remove them.
 	const loadedPackageSources = new Set(
 		loaded.filter((e) => e.sourceInfo?.origin === "package").map((e) => e.sourceInfo.source),
 	);
-	for (const pkg of facade.resourceLoader?.listConfiguredPackages?.() ?? []) {
+	for (const pkg of packages) {
 		if (loadedPackageSources.has(pkg.source)) continue;
 		const manifest = readInstalledPackageJson(pkg.installedPath);
 		infos.push({
@@ -351,14 +371,16 @@ async function buildExtensionInfos(facade: SessionFacade): Promise<RpcExtensionI
 			name: manifest?.name ?? pkg.source,
 			description: manifest?.description,
 			kind: "package",
-			enabled: true,
-			canToggle: false,
+			enabled: pkg.enabled,
+			canToggle: true,
+			packageSource: pkg.source,
 			installable: false,
 			installed: true,
 			path: pkg.installedPath ?? pkg.source,
 			toolCount: 0,
 			commandCount: 0,
 			builtinCommandCount: 0,
+			loadError: packageLoadErrors.get(pkg.source),
 		});
 	}
 
@@ -451,17 +473,13 @@ async function runExtensionLifecycle(
 	if (!fn) {
 		return { ok: false, message: `No ${action} handler for ${extensionId}.`, installed: false };
 	}
+	const registry = facade.settingsManager.extensions;
 	const task = (async () => {
 		try {
+			// The install/uninstall handlers record their outcome in extensions.json
+			// themselves; a failed action leaves whatever was recorded before.
 			const result = await fn(cwd);
-			let installed = action === "install" ? result.ok : false;
-			if (lc.checkInstalled) {
-				try {
-					installed = (await lc.checkInstalled(cwd)).installed;
-				} catch {
-					installed = action === "install" ? result.ok : false;
-				}
-			}
+			const { installed } = await getBuiltinInstallState(registry, extensionId, cwd);
 			return { ok: result.ok, message: result.message, installed };
 		} finally {
 			lifecycleInFlight.delete(extensionId);
@@ -963,18 +981,23 @@ export async function runRpcModeWithFacade(
 			case "get_available_models": {
 				// Return ALL models, annotated with hasAuth so the UI can show
 				// unconfigured models as disabled rather than hiding them.
+				// With authOnly, only configured models are sent (the UI hides the
+				// rest anyway); `total` still lets it tell "no API key configured"
+				// apart from "no models at all".
 				const registry = facade.modelRegistry;
 				const all = registry?.getAll() ?? [];
-				const models = all.map((m) => ({
-					id: m.id,
-					name: m.name,
-					api: m.api,
-					provider: m.provider,
-					reasoning: (m as { reasoning?: boolean }).reasoning,
-					contextWindow: (m as { contextWindow?: number }).contextWindow,
-					hasAuth: registry ? registry.hasConfiguredAuth(m) : true,
-				}));
-				return success(id, "get_available_models", { models });
+				const models = all
+					.map((m) => ({
+						id: m.id,
+						name: m.name,
+						api: m.api,
+						provider: m.provider,
+						reasoning: (m as { reasoning?: boolean }).reasoning,
+						contextWindow: (m as { contextWindow?: number }).contextWindow,
+						hasAuth: registry ? registry.hasConfiguredAuth(m) : true,
+					}))
+					.filter((m) => !command.authOnly || m.hasAuth);
+				return success(id, "get_available_models", { models, total: all.length });
 			}
 
 			case "cycle_model": {
@@ -1350,6 +1373,27 @@ export async function runRpcModeWithFacade(
 			return success(id, "delete_skill", { name: command.skillName });
 		}
 
+		case "install_skill": {
+			// Marketplace install: fetch the skill's directory from its GitHub
+			// repo into ~/.agents/skills (the shared user skills dir), then
+			// re-scan so this session and the skills panel see it without a restart.
+			const skillsDir = facade.resourceLoader?.getUserSkillsDir?.();
+			if (!skillsDir) {
+				return error(id, "install_skill", "This session cannot install skills.");
+			}
+			try {
+				const installed = await installSkillFromGitHub({
+					source: command.source,
+					slug: command.slug,
+					skillsDir,
+				});
+				await refreshSkillsFromDisk(facade);
+				return success(id, "install_skill", installed);
+			} catch (e) {
+				return error(id, "install_skill", e instanceof Error ? e.message : String(e));
+			}
+		}
+
 		case "get_extensions": {
 			const extensions = await buildExtensionInfos(facade);
 			return success(id, "get_extensions", { extensions });
@@ -1361,17 +1405,18 @@ export async function runRpcModeWithFacade(
 		}
 
 		case "set_extension_enabled": {
-			const info = getBuiltinExtensionInfo(command.extensionId);
-			if (!info) {
+			// extensionId is a built-in id or an installed package's source.
+			if (getBuiltinExtensionInfo(command.extensionId)) {
+				facade.settingsManager.setBuiltinExtensionDisabled(command.extensionId, !command.enabled);
+			} else if (!facade.resourceLoader?.setConfiguredPackageEnabled?.(command.extensionId, command.enabled)) {
 				return error(
 					id,
 					"set_extension_enabled",
-					"Only built-in extensions can be toggled. Manage other extensions via `pizza plugin`.",
+					`Not a built-in extension or installed plugin package: ${command.extensionId}`,
 				);
 			}
-			facade.settingsManager.setBuiltinExtensionDisabled(command.extensionId, !command.enabled);
-			// Disabling/enabling a built-in changes which extensions are loaded; that
-			// only takes full effect after the session reloads its resources.
+			// Toggling changes which extensions are loaded; that only takes full
+			// effect after the session reloads its resources.
 			return success(id, "set_extension_enabled", {
 				id: command.extensionId,
 				enabled: command.enabled,
@@ -1397,6 +1442,16 @@ export async function runRpcModeWithFacade(
 				message: result.message,
 				installed: result.installed,
 			});
+		}
+
+		case "install_package": {
+			if (!facade.resourceLoader?.installConfiguredPackage) {
+				return error(id, "install_package", "Package installation is not available in this mode");
+			}
+			await facade.resourceLoader.installConfiguredPackage(command.source);
+			// Resources the package contributes (extensions, skills, ...) only
+			// become active after the session reloads its resources.
+			return success(id, "install_package", { source: command.source, installed: true, requiresReload: true });
 		}
 
 		case "remove_package": {

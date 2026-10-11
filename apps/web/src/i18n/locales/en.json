@@ -426,6 +426,8 @@
       "emptyHint": "Skills will appear here when available.",
       "view": "View",
       "install": "Install",
+      "installing": "Installing…",
+      "installError": "Failed to install skill: {{error}}",
       "installed": "Installed",
       "installedSection": "Installed Skills",
       "directorySection": "Skill Directory",
@@ -473,6 +475,22 @@
       "uninstalling": "Uninstalling…",
       "removePackageConfirm": "Remove package \"{{name}}\"? Its resources stay loaded until the session restarts.",
       "removePackageFailed": "Failed to remove the package.",
+      "loadFailed": "Load failed",
+            "search": "Search extensions...",
+      "installedSection": "Installed Extensions",
+      "directory": {
+        "section": "Pi Package Directory",
+        "compatNote": "Packages from pi.dev are built for pi, not pizza. Most common API imports are mapped automatically, but compatibility is not guaranteed — some packages may fail to load or behave differently. Install executes package code.",
+        "empty": "No packages found",
+        "view": "View on pi.dev",
+        "npm": "Open on npm",
+        "repo": "Open repository",
+        "install": "Install",
+        "installing": "Installing…",
+        "installed": "Installed",
+        "installFailed": "Failed to install the package.",
+        "installedMsg": "Installed {{name}}. Restart the session to activate it."
+      },
       "actions": "Actions",
       "permissions": {
         "checking": "Checking desktop automation permissions",
@@ -674,17 +692,14 @@
       "bannerBody": "Pick a provider below and enter your API key to start. No providers are configured yet, so the agent is currently unavailable.",
       "restarting": "Restarting the sidecar to pick up the new key..."
     },
-    "update": {
-      "title": "About & Updates",
-      "currentVersion": "Current version",
-      "latestVersion": "Latest release",
-      "status": "Status",
-      "checking": "Checking…",
-      "checkFailed": "Check failed (offline?)",
-      "available": "Update available: {{version}}",
-      "upToDate": "Up to date",
-      "checkNow": "Check for updates",
-      "download": "Download {{version}}"
+    "about": {
+      "title": "About",
+      "tagline": "An open-source, event-driven agent — every conversation, tool call, and file edit is an event in an immutable log.",
+      "version": "Version",
+      "repository": "GitHub repository",
+      "license": "License",
+      "updateAvailable": "New version {{version}} available",
+      "updateTo": "Update to {{version}}"
     },
     "scheduler": {
       "title": "Scheduled task defaults",
@@ -696,7 +711,15 @@
   },
   "update": {
     "banner": "A new version of Pizza ({{version}}) is available.",
-    "download": "Download"
+    "download": "Download",
+    "install": "Update now",
+    "downloading": "Downloading…",
+    "downloadingPercent": "Downloading {{percent}}%",
+    "waitingForAgents": "Waiting for {{count}} running task(s)…",
+    "installing": "Installing…",
+    "retry": "Retry",
+    "manualDownload": "Download manually",
+    "failed": "Update failed: {{error}}"
   },
   "language": {
     "en": "English",

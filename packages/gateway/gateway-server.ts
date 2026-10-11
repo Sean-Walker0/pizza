@@ -17,7 +17,7 @@
  */
 
 import { type Server, type Socket, connect, createServer } from "node:net";
-import { chmodSync, unlinkSync } from "node:fs";
+import { chmodSync, statSync, unlinkSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { platform } from "node:os";
 import { basename, join } from "node:path";
@@ -26,6 +26,7 @@ import { RpcClient } from "../rpc/rpc-client.js";
 import { resolveCliSpawn } from "../rpc/cli-spawn.js";
 import { ChannelSupervisor } from "./channel-supervisor.js";
 import { listKnownWorkspaces } from "../../src/core/event-store/workspace.js";
+import { prefetchLoginShellPath } from "../../src/utils/login-shell-path.js";
 import { normalizeCwd, scheduledCwdsOnDisk } from "./scheduler-guard.js";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.js";
 import {
@@ -193,6 +194,11 @@ export interface GatewayServerEvents {
 	 * run. Emitted instead of `listening`; a duplicate daemon exits.
 	 */
 	duplicate: (socketPath: string) => void;
+	/**
+	 * The socket path was stolen by a newer gateway — this daemon can no
+	 * longer serve clients and shuts down. Emitted before stop() runs.
+	 */
+	displaced: (socketPath: string) => void;
 	/** An unexpected error. */
 	error: (error: Error) => void;
 }
@@ -376,6 +382,10 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
 		const interactive = opts?.interactive === true;
 		const isMainAgent = mainDir !== undefined && cwd === mainDir;
 		const extraArgs = isMainAgent ? ["--main"] : undefined;
+		// Capture the login-shell PATH once (exported via env) so the agent
+		// inherits it instead of blocking its event loop for ~1s+ re-running
+		// the user's shell rc files on its first exec.
+		if (!options.createAgent) await prefetchLoginShellPath();
 		const client = options.createAgent
 			? options.createAgent(cwd, { interactive })
 			: new RpcClient({ cwd, cliPath, binary, env: makeEnv(interactive), args: extraArgs });
@@ -1070,6 +1080,31 @@ function nextMessageId(): string {
 	}
 
 	/**
+	 * Detect the socket path being stolen: a second gateway that unlinks and
+	 * rebinds the path leaves this listener bound to a detached inode —
+	 * unreachable by any client, yet the process keeps running agents and
+	 * channel adapters forever. The zombie then fights the new owner (two
+	 * supervisors spawning the same channels → e.g. webhook EADDRINUSE).
+	 * Watch the path's inode and shut down gracefully once it no longer
+	 * points at our socket. Unix only: on Windows a named pipe can never be
+	 * stolen this way (EADDRINUSE means a live owner, probed before listen).
+	 */
+	function startOwnershipWatch(): void {
+		if (platform() === "win32" || !socketIno) return;
+		ownershipTimer = setInterval(() => {
+			try {
+				const s = statSync(socketPath);
+				if (s.dev === socketDev && s.ino === socketIno) return;
+			} catch {
+				/* path gone — the listener is unreachable either way */
+			}
+			emitter.emit("displaced", socketPath as never);
+			void stop();
+		}, 5000);
+		ownershipTimer.unref?.();
+	}
+
+	/**
 	 * Probe whether the process currently bound to the gateway socket is
 	 * alive and answering. Used on EADDRINUSE: the classic "stale socket
 	 * from a crashed daemon" is only ONE cause — another is a LIVE gateway
@@ -1100,6 +1135,11 @@ function nextMessageId(): string {
 
 	/** Set once we actually own the socket; a duplicate never does. */
 	let listening = false;
+	/** dev/ino of the socket file we bound — lets the ownership watchdog
+	 *  tell our socket from one a newer gateway rebound over us. */
+	let socketDev = 0;
+	let socketIno = 0;
+	let ownershipTimer: ReturnType<typeof setInterval> | undefined;
 	/** Report that a live gateway owns the socket; this instance must not run. */
 	const reportDuplicate = (): void => {
 		emitter.emit("duplicate", socketPath as never);
@@ -1107,6 +1147,9 @@ function nextMessageId(): string {
 
 	async function start(): Promise<void> {
 		if (server) return;
+		// Warm the login-shell PATH in the background so the first agent
+		// spawn (spawnAgent awaits it) rarely has to wait.
+		if (!options.createAgent) void prefetchLoginShellPath();
 		// Windows: a named pipe exists only while its owner process is alive,
 		// so there is no stale-socket case — an answering pipe IS a live
 		// gateway. Probe BEFORE listening: listening on an occupied pipe
@@ -1123,6 +1166,13 @@ function nextMessageId(): string {
 				server!.off("error", onError);
 				listening = true;
 				restrictSocketPermissions(socketPath);
+				try {
+					const s = statSync(socketPath);
+					socketDev = s.dev;
+					socketIno = s.ino;
+				} catch {
+					/* best effort — watchdog stays off */
+				}
 				emitter.emit("listening", socketPath as never);
 				resolve(false);
 			};
@@ -1170,6 +1220,7 @@ function nextMessageId(): string {
 		}
 		startHealthCheck();
 		startSchedulerGuard();
+		startOwnershipWatch();
 		// After the socket is listening: adapters the supervisor spawns connect
 		// back to this gateway immediately, so start it only once we can serve.
 		channelSupervisor.start();
@@ -1178,6 +1229,7 @@ function nextMessageId(): string {
 	async function stop(): Promise<void> {
 		if (shuttingDown) return;
 		shuttingDown = true;
+		if (ownershipTimer) { clearInterval(ownershipTimer); ownershipTimer = undefined; }
 		stopHealthCheck();
 		stopSchedulerGuard();
 		await channelSupervisor.shutdown();
@@ -1198,13 +1250,17 @@ function nextMessageId(): string {
 			server.close(() => resolve());
 		});
 		// Remove the socket file (Unix only) — but only if it is OURS: a
-		// duplicate that never listened would otherwise unlink the live
-		// gateway's socket out from under it.
+		// duplicate that never listened, or a displaced zombie whose path was
+		// stolen, would otherwise unlink the live gateway's socket out from
+		// under it.
 		if (listening && platform() !== "win32") {
 			try {
-				unlinkSync(socketPath);
+				const s = statSync(socketPath);
+				if (socketIno === 0 || (s.dev === socketDev && s.ino === socketIno)) {
+					unlinkSync(socketPath);
+				}
 			} catch {
-				/* ignore */
+				/* already gone or unreadable */
 			}
 		}
 	}

@@ -320,6 +320,18 @@ pub fn kill_sidecar_for_cwd(state: &BridgeState, cwd: &str) {
 	}
 }
 
+/// Drop every gateway channel and kill every legacy sidecar — used right
+/// before an update replaces the app bundle.
+pub fn shutdown_all_agents(state: &BridgeState) {
+	for (_, channel) in lock_ok(&state.channels).drain() {
+		channel.close();
+	}
+	let cwds: Vec<String> = lock_ok(&state.sidecars).keys().cloned().collect();
+	for cwd in cwds {
+		kill_sidecar_for_cwd(state, &cwd);
+	}
+}
+
 /// Kill all sidecars for a given window (by active cwd).
 pub fn kill_sidecar_for_window(state: &BridgeState, window_label: &str) {
 	let cwd = {
@@ -826,6 +838,9 @@ fn spawn_background_sidecar(
 	state: &BridgeState,
 	cwd: String,
 ) -> Result<(), String> {
+	if crate::updater::is_installing() {
+		return Err("Pizza is installing an update".into());
+	}
 	if !std::path::Path::new(&cwd).is_dir() {
 		return Err(format!("Directory does not exist: {}", cwd));
 	}
@@ -1017,6 +1032,9 @@ pub async fn init_sidecar(
 ) -> Result<String, String> {
 	let window_label = window.label().to_string();
 	log_file(&format!("init_sidecar: start, window={}", window_label));
+	if crate::updater::is_installing() {
+		return Err("Pizza is installing an update and will restart shortly".into());
+	}
 
 	let cwd = cwd.unwrap_or_else(|| {
 		PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -3710,6 +3728,34 @@ pub async fn fetch_skills_sh() -> Result<String, String> {
 	Ok(html)
 }
 
+/// Fetch a pi.dev packages catalog page via Rust (bypasses CORS).
+/// `query` is the raw query string (e.g. "type=extension&sort=downloads&page=1").
+#[tauri::command]
+pub async fn fetch_pi_packages(query: String) -> Result<String, String> {
+	let client = reqwest::Client::builder()
+		.user_agent("pizza-desktop/0.1")
+		.timeout(Duration::from_secs(15))
+		.build()
+		.map_err(|e| format!("HTTP client error: {e}"))?;
+
+	let res = client
+		.get(format!("https://pi.dev/packages?{query}"))
+		.send()
+		.await
+		.map_err(|e| format!("Fetch error: {e}"))?;
+
+	if !res.status().is_success() {
+		return Err(format!("pi.dev returned status {}", res.status()));
+	}
+
+	let html = res
+		.text()
+		.await
+		.map_err(|e| format!("Read body error: {e}"))?;
+
+	Ok(html)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -4144,8 +4190,8 @@ fn pick_platform_asset(asset_urls: &[String]) -> Option<String> {
 }
 
 const GITHUB_LATEST_RELEASE_API: &str =
-	"https://api.github.com/repos/tomsun28/pizza/releases/latest";
-const GITHUB_RELEASES_PAGE: &str = "https://github.com/tomsun28/pizza/releases/latest";
+	"https://api.github.com/repos/pizza-agent/pizza/releases/latest";
+const GITHUB_RELEASES_PAGE: &str = "https://github.com/pizza-agent/pizza/releases/latest";
 
 /// Check GitHub releases for a newer desktop app version. Never fails hard —
 /// network problems come back as `AppUpdateInfo.error` so the caller can
