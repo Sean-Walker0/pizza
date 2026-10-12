@@ -17,11 +17,11 @@ import type {
 } from "../extensions/index.js";
 import type { ImageContent } from "../event-store/types.js";
 import type { SqliteEventStore } from "../event-store/sqlite-store.js";
-import type { ModelRegistry } from "../model-registry.js";
+import type { ModelRegistry } from "../models/model-registry.js";
 import type { SessionProjection } from "../projection/session-projection.js";
 import type { SessionManager as ProjectionSessionManager } from "../projection/session-manager.js";
 import type { EventSourcedRuntime } from "../runtime/runtime.js";
-import { isPersistableThinkingLevel, type SettingsManager } from "../settings-manager.js";
+import { isPersistableThinkingLevel, type SettingsManager } from "../config/settings-manager.js";
 import type { ThinkingLevel } from "../agent/index.js";
 import type { ToolAssembly } from "./tool-assembly.js";
 
@@ -185,7 +185,7 @@ export function bindExtensionCore(deps: ExtensionBindingDeps): void {
 			setModel: async (nextModel) => {
 				if (!modelRegistry.hasConfiguredAuth(nextModel)) return false;
 				deps.setFallbackModel(nextModel);
-				getRuntime()?.setModel(nextModel.provider, nextModel.id);
+				getRuntime()?.setModel(nextModel.provider, nextModel.id, nextModel.contextWindow);
 				// Persist as global default so the next sidecar launch picks it
 				// up. Best-effort: a settings-write failure must not break the
 				// in-progress turn (in-memory state is already updated above).

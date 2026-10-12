@@ -8,8 +8,8 @@ import type { ContentBlock, EventBase } from "../src/core/event-store/types.js";
 import type { ToolRegistry } from "../src/core/intent/types.js";
 import type { LLMClient, LLMResponse } from "../src/core/runtime/llm-types.js";
 import { EventSourcedRuntime } from "../src/core/runtime/runtime.js";
-import { SessionFacade } from "../src/core/session-facade.js";
-import { SettingsManager } from "../src/core/settings-manager.js";
+import { SessionFacade } from "../src/core/session/session-facade.js";
+import { SettingsManager } from "../src/core/config/settings-manager.js";
 import { runPrintModeWithFacade } from "../src/modes/print-mode.js";
 
 const tempDirs: string[] = [];
