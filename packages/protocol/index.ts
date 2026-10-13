@@ -171,6 +171,55 @@ export interface NetworkSettings {
 	proxy?: string;
 }
 
+/** Voice settings (settings.json `voice`) — inbound voice-message
+ *  transcription for channel adapters. API providers first, `cli` as the
+ *  local fallback. Secrets stay out of this file: `apiKey` accepts
+ *  "env:NAME" / "!command" indirections, and unset falls back to
+ *  auth.json[provider] then provider env vars. */
+export interface VoiceSettings {
+	/** "groq": Groq whisper endpoint. "openai-compatible": any
+	 *  /audio/transcriptions API (OpenAI, DeepInfra, …). "cli": a local
+	 *  command template like whisper.cpp. */
+	provider?: "groq" | "openai-compatible" | "cli";
+	/** STT model id; provider default when unset (groq → whisper-large-v3-turbo). */
+	model?: string;
+	/** Transcriptions endpoint base — required for "openai-compatible". */
+	baseUrl?: string;
+	/** Optional key override — env var name, "!command", or literal. */
+	apiKey?: string;
+	/** BCP-47 language hint for providers that accept one. */
+	language?: string;
+	/** Voice clips shorter than this are skipped (default 0). */
+	minDurationMs?: number;
+	/** Clips longer than this are rejected — long recordings burn STT time
+	 *  (default 300_000 = 5 min). */
+	maxDurationMs?: number;
+	/** "cli" provider: command template; `{file}` is the audio path. */
+	command?: string;
+	/** "cli" provider: audio format fed to the command (default "wav"). */
+	format?: string;
+	/** Outbound TTS — how agent replies become voice messages. "off" (default):
+	 *  text only. "mirror": reply by voice when the inbound message was voice.
+	 *  "always": voice every reply. "agent": only <speak>…</speak> segments. */
+	outboundMode?: "off" | "mirror" | "always" | "agent";
+	/** Outbound provider — same provider ids as inbound. */
+	outboundProvider?: "groq" | "openai-compatible" | "cli";
+	/** Outbound TTS baseUrl (openai-compatible; groq has a fixed default). */
+	outboundBaseUrl?: string;
+	/** Outbound TTS model (e.g. "tts-1", groq "playai-tts"). */
+	outboundModel?: string;
+	/** Outbound voice id (e.g. "alloy"). */
+	outboundVoice?: string;
+	/** Outbound key override — env name / "!command" / literal; falls back to
+	 *  voice.apiKey → auth.json[provider] → env. */
+	outboundApiKey?: string;
+	/** cli outbound: command template; `{text}` = file with the reply text,
+	 *  `{out}` = audio output path. */
+	sayCommand?: string;
+	/** cli outbound audio format produced by sayCommand (default "opus"). */
+	sayFormat?: string;
+}
+
 /** Lightweight status snapshot returned to UI when listing tasks. */
 export interface ScheduledTaskSummary extends ScheduledTask {
 	/** Next scheduled fire time, or null if disabled / past endAt. */
@@ -263,6 +312,12 @@ export type RpcCommand =
 	// Bash
 	| { id?: string; type: "bash"; command: string }
 	| { id?: string; type: "abort_bash" }
+
+	// Voice input (desktop dictation). base64 audio + container format
+	// ("webm", "mp4", "wav", …); the sidecar runs the configured voice
+	// pipeline (settings.json `voice`) and returns transcript text. Fails
+	// when no inbound provider is configured.
+	| { id?: string; type: "transcribe_audio"; audioB64: string; format: string; durationMs?: number }
 
 	// Session
 	| { id?: string; type: "get_session_stats" }
@@ -579,6 +634,7 @@ export type RpcResponse =
 
 	// Bash
 	| { id?: string; type: "response"; command: "bash"; success: true; data: unknown }
+	| { id?: string; type: "response"; command: "transcribe_audio"; success: true; data: { text: string; provider: string } }
 	| { id?: string; type: "response"; command: "abort_bash"; success: true }
 
 	// Session

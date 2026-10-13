@@ -2,7 +2,8 @@ import { memo, useState, useEffect, useLayoutEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { cn } from "@/lib/utils";
 import { highlightText } from "@/lib/highlight";
-import { INTERNAL_MESSAGE_KINDS, parseTellCommand, workspaceNameFrom, type AgentMessageInfo } from "@/lib/agent-messages";
+import { INTERNAL_MESSAGE_KINDS, parseTellCommand, splitVoiceSegments, workspaceNameFrom, type AgentMessageInfo } from "@/lib/agent-messages";
+import { VoiceClipChip } from "./VoiceClip";
 import { CHANNEL_TYPES } from "@/lib/channels";
 import { Markdown } from "./Markdown";
 import { Button, Badge } from "@/components/ui";
@@ -56,6 +57,10 @@ export interface TimelineItem {
 	};
 	/** Unix ms timestamp when the message was emitted. */
 	timestamp?: number;
+	/** Unix ms when the tool started executing (TOOL_EXECUTION_START / upsert). */
+	toolStartedAt?: number;
+	/** Final execution time from TOOL_EXECUTION_END (`duration_ms`). */
+	toolDurationMs?: number;
 	/** Parsed cross-workspace agent message (rendered as a dedicated card). */
 	agentMessage?: AgentMessageInfo;
 }
@@ -323,6 +328,24 @@ function ToolImage({ src, index, count }: { src: string; index: number; count: n
 	);
 }
 
+/** Compact duration: "1.2s" under a minute, "1m 23s" above it. */
+function formatDuration(ms: number): string {
+	if (ms < 1000) return `${Math.round(ms)}ms`;
+	const total = Math.round(ms / 100) / 10;
+	if (total < 60) return `${total}s`;
+	return `${Math.floor(total / 60)}m ${Math.round(total % 60)}s`;
+}
+
+/** Ticking elapsed-time badge for a running tool (re-renders every 500ms). */
+const Elapsed = memo(function Elapsed({ since }: { since: number }) {
+	const [, tick] = useState(0);
+	useEffect(() => {
+		const t = setInterval(() => tick((n) => n + 1), 500);
+		return () => clearInterval(t);
+	}, []);
+	return <>{formatDuration(Math.max(0, Date.now() - since))}</>;
+});
+
 const ToolCard = memo(function ToolCard({
 	item,
 	onResolveApproval,
@@ -401,7 +424,7 @@ const ToolCard = memo(function ToolCard({
 							</>
 						)}
 					</span>
-					<span className="flex shrink-0 items-center gap-1">
+					<span className="flex shrink-0 items-center gap-0.5">
 						<span
 							className={cn(
 								"flex items-center gap-1 text-[11px]",
@@ -411,6 +434,21 @@ const ToolCard = memo(function ToolCard({
 							{running && <Loader2 className="h-3 w-3 animate-spin" />}
 							{item.isError && <AlertCircle className="h-3 w-3" />}
 							{item.status}
+							{item.toolStartedAt !== undefined && (
+								<span
+									className="text-muted/50 tabular-nums"
+									title={t("tools.startedAt", { time: new Date(item.toolStartedAt).toLocaleString() })}
+								>
+									· {formatMessageTime(item.toolStartedAt)}
+								</span>
+							)}
+							{item.toolDurationMs !== undefined ? (
+								<span className="min-w-12 text-right text-muted/60 tabular-nums">· {formatDuration(item.toolDurationMs)}</span>
+							) : running && item.toolStartedAt !== undefined ? (
+								<span className="min-w-12 text-right text-muted/60 tabular-nums">
+									· <Elapsed since={item.toolStartedAt} />
+								</span>
+							) : null}
 						</span>
 						{(command || item.toolResult) && (
 							<button
@@ -693,7 +731,15 @@ const AgentMessageCard = memo(function AgentMessageCard({
 					)}
 				</div>
 				<div className="select-text whitespace-pre-wrap break-words px-4 py-3 text-sm leading-relaxed text-fg">
-					{highlight ? highlightText(am.body, highlight, highlightActive) : am.body}
+					{splitVoiceSegments(am.body).map((seg, i) =>
+						seg.type === "voice" ? (
+							<VoiceClipChip key={i} clip={seg.clip} />
+						) : highlight ? (
+							highlightText(seg.text, highlight, highlightActive)
+						) : (
+							seg.text
+						),
+					)}
 				</div>
 			</div>
 			<div

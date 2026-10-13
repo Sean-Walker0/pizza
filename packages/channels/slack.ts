@@ -27,6 +27,17 @@ import {
 	routeHttpsThroughProxy,
 } from "./runtime.js";
 import type { ChannelAdapter } from "./types.js";
+import { cacheClipForPlayback, createVoicePipeline, voicePrompt } from "./voice.js";
+
+/** Slack file-share entry (subset). Audio uploads and recorded clips both
+ *  land here — mimetype "audio/*" or duration_ms marks a voice clip. */
+interface SlackFile {
+	id: string;
+	name?: string;
+	mimetype?: string;
+	url_private_download?: string;
+	duration_ms?: number;
+}
 
 export default {
 	validate(input) {
@@ -63,6 +74,50 @@ export default {
 			socketMode: true,
 			...(proxyAgent ? { agent: proxyAgent } : {}),
 		});
+
+		// Inside the daemon an unhandled adapter error is an uncaughtException —
+		// bolt's app.error consumes listener/receiver errors so they can't
+		// kill the gateway (and every pooled agent with it).
+		app.error(async (err) => {
+			console.error("[slack] app error:", errorMessage(err));
+		});
+		// @slack/socket-mode drives a finity state machine that THROWS on
+		// unhandled events (e.g. a 'server explicit disconnect' arriving
+		// mid-'connecting' during proxy reconnects). The throw escapes
+		// through the ws callback → uncaughtException → dead gateway. finity
+		// only throws when global.unhandledEventHooks is empty, so push a
+		// hook — that covers both the synchronous handle() path AND events
+		// handled inside finity's async task queue, where a try/catch
+		// wrapper could never reach. The client recovers via reconnect timers.
+		{
+			type SM = {
+				handle?: (event: string, payload?: unknown) => unknown;
+				/** finity internals: global config carries unhandledEventHooks. */
+				config?: { global?: { unhandledEventHooks?: ((event: string, state: string, ctx: unknown) => void)[] } };
+			};
+			const sm = (app as unknown as { receiver?: { client?: { stateMachine?: SM } } }).receiver?.client?.stateMachine;
+			const hooks = sm?.config?.global?.unhandledEventHooks;
+			if (Array.isArray(hooks)) {
+				hooks.push((event: string, state: string) =>
+					console.error(`[slack] ignored unhandled state-machine event '${event}' in state '${state}'`),
+				);
+			} else if (sm && typeof sm.handle === "function") {
+				// Fallback for a finity without the hook array — still guard
+				// the synchronous handle() path.
+				const orig = sm.handle.bind(sm);
+				sm.handle = (event: string, payload?: unknown) => {
+					try {
+						return orig(event, payload);
+					} catch (err) {
+						console.error(`[slack] ignored unhandled state-machine event '${event}':`, errorMessage(err));
+						return undefined;
+					}
+				};
+			}
+		}
+
+		// Voice pipeline — no-op unless settings.json has a `voice` section.
+		const voice = createVoicePipeline(runtime.dir);
 
 		// auth.test doubles as the fast-fail credential check — a bad token exits
 		// here so the supervisor marks the channel "error" instead of "connected".
@@ -102,10 +157,44 @@ export default {
 			text: string;
 			ts: string;
 			threadTs?: string;
+			files?: SlackFile[];
 			say: (input: { text: string; thread_ts?: string }) => Promise<unknown>;
 		}): Promise<void> {
 			const name = input.dm ? "dm" : await channelName(input.channelId);
-			const text = input.text.replace(/<@[A-Z0-9]+>/g, "").trim(); // strip the @bot mention
+			let text = input.text.replace(/<@[A-Z0-9]+>/g, "").trim(); // strip the @bot mention
+
+			// Audio file shares (voice clips, mp3s): download via the bot token
+			// and transcribe when a voice provider is configured.
+			const clip = input.files?.find(
+				(f) => f.mimetype?.startsWith("audio/") || /\.(mp3|m4a|wav|ogg|oga|opus|webm)$/i.test(f.name ?? ""),
+			);
+			const thread_ts0 = input.threadTs ?? input.ts;
+			if (clip && !voice.enabled) {
+				text =
+					voicePrompt({ key: clip.id, durationMs: clip.duration_ms }) + (text ? `\n${text}` : "");
+			} else if (clip?.url_private_download) {
+				try {
+					const res = await fetch(clip.url_private_download, {
+						headers: { authorization: `Bearer ${config.token}` },
+						signal: AbortSignal.timeout(60_000),
+					});
+					if (!res.ok) throw new Error(`file download failed (HTTP ${res.status})`);
+					const buf = Buffer.from(await res.arrayBuffer());
+					const format = clip.name?.split(".").pop() ?? clip.mimetype?.split("/").pop() ?? "mp4";
+					const cached = await cacheClipForPlayback(runtime.dir, "slack", clip.id, format, buf);
+					const result = await voice.transcribe({ audio: buf, format, durationMs: clip.duration_ms });
+					text =
+						voicePrompt({ key: clip.id, durationMs: clip.duration_ms, transcript: result?.text, file: cached }) +
+						(text ? `\n${text}` : "");
+				} catch (err) {
+					console.error(`[slack] voice transcription failed in ${name}:`, errorMessage(err));
+					await input
+						.say({ text: `⚠️ Voice transcription failed: ${errorMessage(err)}`, thread_ts: thread_ts0 })
+						.catch(() => {});
+					text = voicePrompt({ key: clip.id, durationMs: clip.duration_ms }) + (text ? `\n${text}` : "");
+				}
+			}
+
 			if (!text) return;
 
 			// Instant read-receipt — an 👀 reaction says "received" without waiting
@@ -132,6 +221,7 @@ export default {
 				dm: false,
 				userId: event.user,
 				text: event.text ?? "",
+				files: (event as { files?: SlackFile[] }).files,
 				ts: event.ts,
 				threadTs: "thread_ts" in event ? (event.thread_ts as string | undefined) : undefined,
 				say: (m) => say(m),
@@ -142,7 +232,7 @@ export default {
 		// too — they are already handled by app_mention, so skip them to avoid
 		// delivering twice).
 		app.message(async ({ event, say }) => {
-			const e = event as { channel_type?: string; user?: string; text?: string; ts: string; channel: string; thread_ts?: string };
+			const e = event as { channel_type?: string; user?: string; text?: string; ts: string; channel: string; thread_ts?: string; files?: SlackFile[] };
 			const isDm = e.channel_type === "im";
 			const isMention = !!e.text?.includes(`<@${botUserId}>`);
 			if (!isDm && (!ANSWER_ALL || isMention)) return;
@@ -151,6 +241,7 @@ export default {
 				dm: isDm,
 				userId: e.user,
 				text: e.text ?? "",
+				files: e.files,
 				ts: e.ts,
 				threadTs: e.thread_ts,
 				say: (m) => say(m),

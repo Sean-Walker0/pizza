@@ -2882,6 +2882,36 @@ pub async fn transcribe_audio(audio_b64: String, mime_type: String) -> Result<St
 	Ok(text)
 }
 
+/// Read a cached inbound voice clip — adapter-written files under
+/// `<agentDir>/voice-cache/`. `rel_path` comes from the `<voice file="…">`
+/// tag; traversal outside the cache dir is rejected. Returns base64.
+#[tauri::command]
+pub async fn read_voice_clip(rel_path: String) -> Result<String, String> {
+	log_file(&format!("read_voice_clip: {}", rel_path));
+	// rel_path is agentDir-relative and already includes the `voice-cache/`
+	// prefix (e.g. "voice-cache/lark/<key>.m4a") — resolve against agent_dir,
+	// then verify it stays inside voice-cache/.
+	let agent = agent_dir()?;
+	let cache_dir = agent.join("voice-cache");
+	let full = agent.join(&rel_path);
+	let canonical = full
+		.canonicalize()
+		.map_err(|e| format!("voice clip not found: {e}"))?;
+	let root = cache_dir
+		.canonicalize()
+		.map_err(|e| format!("voice-cache dir: {e}"))?;
+	if !canonical.starts_with(&root) {
+		return Err("voice clip path escapes the cache directory".to_string());
+	}
+	let metadata = std::fs::metadata(&canonical).map_err(|e| format!("metadata: {e}"))?;
+	const MAX_SIZE: u64 = 25 * 1024 * 1024;
+	if metadata.len() > MAX_SIZE {
+		return Err(format!("voice clip too large ({} bytes)", metadata.len()));
+	}
+	let bytes = std::fs::read(&canonical).map_err(|e| format!("read: {e}"))?;
+	Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
+}
+
 /// Check if a command exists in PATH.
 /// Uses `/usr/bin/which` on macOS (since `which` is a shell built-in)
 /// and `which` on other platforms.

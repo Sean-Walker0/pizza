@@ -815,16 +815,31 @@ export default function AgentView({
 				const isError = reason === "error" || Boolean(errorMessage);
 				if (id) {
 					updateItems((prev) =>
-						prev.map((it) =>
-							it.id === id
-								? {
-										...it,
-										status: isError ? "ERROR" : "DONE",
-										streaming: false,
-										isError: isError || undefined,
-									}
-								: it,
-						),
+						prev.map((it) => {
+							if (it.id === id) {
+								return {
+									...it,
+									status: isError ? "ERROR" : "DONE",
+									streaming: false,
+									isError: isError || undefined,
+								};
+							}
+							// A tool card still RUNNING when the turn ends never got
+							// its TOOL_EXECUTION_END (aborted mid-exec, gateway stop,
+							// missed event). Settle it so the card doesn't spin
+							// forever; freeze the elapsed timer at turn end.
+							if (it.role === "tool" && it.streaming && !it.toolResult) {
+								return {
+									...it,
+									status: "INTERRUPTED",
+									streaming: false,
+									toolDurationMs:
+										it.toolDurationMs ??
+										(it.toolStartedAt !== undefined ? Date.now() - it.toolStartedAt : undefined),
+								};
+							}
+							return it;
+						}),
 					);
 					if (isForCurrent) {
 						activeAssistantRef.current = null;
@@ -864,12 +879,15 @@ export default function AgentView({
 			case "TOOL_EXECUTION_START": {
 				const payload = event.payload as Record<string, unknown>;
 				const toolCallId = payload.tool_call_id as string;
+				// The store timestamp is the real start instant — accurate even
+				// when replaying history (Date.now() would say "just now").
+				const startedAt = typeof event.timestamp === "number" ? event.timestamp : Date.now();
 				// Execution started -> the tool was approved (or did not need approval).
 				// Transition the card out of pending-approval into running.
 				updateItems((prev) =>
 					prev.map((it) =>
 						it.id === toolCallId && it.role === "tool"
-							? { ...it, pendingApproval: undefined, status: "RUNNING", streaming: true }
+							? { ...it, pendingApproval: undefined, status: "RUNNING", streaming: true, toolStartedAt: startedAt }
 							: it,
 					),
 				);
@@ -915,11 +933,13 @@ export default function AgentView({
 					: "";
 				const resultImages = result ? result.flatMap((r) => (r.type === "image" ? messageImages({ content: [r] }) : [])) : [];
 				const isError = payload.is_error === true;
+				const durationMs = typeof payload.duration_ms === "number" ? payload.duration_ms : undefined;
 				updateItems((prev) =>
 					prev.map((it) =>
 						it.id === toolCallId && it.role === "tool"
 							? {
 									...it,
+									...(durationMs !== undefined ? { toolDurationMs: durationMs } : {}),
 									status: isError ? "ERROR" : "DONE",
 									streaming: false,
 									toolResult: resultText || it.toolResult,
