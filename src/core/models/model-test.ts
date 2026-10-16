@@ -25,9 +25,14 @@ export interface ModelTestResult {
 
 /** Cap on the reply snippet returned to the UI. */
 const MAX_RESPONSE_CHARS = 200;
-/** Budget for the probe. Generous enough that reasoning models still emit a
- *  text snippet after their thinking; still a negligible-cost request. */
-const TEST_MAX_TOKENS = 128;
+/**
+ * Output budget for the probe. Reasoning models (GLM, MiniMax M2.x, ...)
+ * think by default before answering; a small cap gets fully consumed by the
+ * thinking phase and the reply ends truncated (stopReason "length") with no
+ * text block at all. 2048 leaves room for thinking plus a short answer while
+ * staying a negligible-cost request — providers bill actual usage, not the cap.
+ */
+const TEST_MAX_TOKENS = 2048;
 
 export async function testModel(registry: ModelRegistry, model: Model<Api>): Promise<ModelTestResult> {
 	const base: ModelTestResult = {
@@ -62,11 +67,16 @@ export async function testModel(registry: ModelRegistry, model: Model<Api>): Pro
 		if (message.stopReason === "error") {
 			return { ...base, error: message.errorMessage ?? "provider returned an error", latencyMs };
 		}
+		// Prefer the answer text; fall back to the thinking excerpt for the rare
+		// case where the thinking phase still ate the whole budget (stopReason
+		// "length") so the UI always shows what the model actually produced.
 		const text = message.content.find((c) => c.type === "text")?.text?.trim() ?? "";
+		const thinking = message.content.find((c) => c.type === "thinking")?.thinking?.trim() ?? "";
+		const shown = (text || thinking).slice(0, MAX_RESPONSE_CHARS);
 		return {
 			...base,
 			ok: true,
-			response: text ? text.slice(0, MAX_RESPONSE_CHARS) : null,
+			response: shown || null,
 			latencyMs,
 		};
 	} catch (error) {
