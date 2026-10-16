@@ -5,6 +5,8 @@
  * Provides unified interface for UI layers.
  */
 
+import { compactWithDeadline } from "./compaction-deadline.js";
+
 import type { AgentMessage } from "../agent/types.js";
 import type { EventBase, ImageContent, FileAttachment } from "../event-store/types.js";
 import type { EventStore, SubscribeOptions } from "../event-store/store.js";
@@ -204,10 +206,20 @@ export class EventSourcedRuntime {
 				systemPrompt: this.config.systemPrompt,
 				model: this.config.model,
 				contextBudget: this.config.contextBudget ?? 128000,
+				getContextBudget: () => this.config.contextBudget ?? 128000,
 				tools: this.config.tools,
 				retryPolicy: this.config.retryPolicy,
 				retryAssistantErrorCompletions: this.config.retryAssistantErrorCompletions,
 				compactionPolicy: this._buildCompactionPolicy(projection),
+			onObservedContextTokens: (tokens) => {
+				// Self-correct an understated contextBudget: if the provider
+				// demonstrably served a prompt larger than our configured
+				// window, the catalog value was wrong — widen so truncation
+				// and the compaction threshold stop firing early.
+				if (Number.isFinite(tokens) && tokens > (this.config.contextBudget ?? 128000)) {
+					this.config.contextBudget = tokens;
+				}
+			},
 			sessionManager: this.sessionManager,
 			refreshSystemPrompt: this.config.refreshSystemPrompt,
 			beforeAgentStart: this.config.beforeAgentStart,
@@ -483,7 +495,7 @@ export class EventSourcedRuntime {
 				caused_by: causedBy,
 			});
 			const policy = this._buildCompactionPolicy(this.getProjection());
-			const outcome = await policy.compact(reason, abortController.signal);
+			const outcome = await compactWithDeadline(policy, reason, abortController);
 			this.store.append({
 				actor_id: "compactor",
 				type: "COMPACTION_END",
@@ -497,7 +509,7 @@ export class EventSourcedRuntime {
 					actor_id: "compactor",
 					type: "COMPACTION_ABORTED",
 					payload: {
-						reason: abortController.signal.aborted ? "user_cancelled" : "error",
+						reason: abortController.signal.reason?.name === "TimeoutError" ? "timeout" : abortController.signal.aborted ? "user_cancelled" : "error",
 						message: msg,
 						token_count: tokenCount,
 					},
@@ -519,6 +531,7 @@ export class EventSourcedRuntime {
 			projection,
 			llmClient: this.config.llmClient,
 			model: this.config.model,
+			getContextWindow: () => this.config.compactionEngineSettings?.contextWindow ?? this.config.contextBudget ?? 128000,
 			settings: {
 				contextWindow: this.config.contextBudget ?? 128000,
 				...this.config.compactionEngineSettings,
@@ -602,10 +615,17 @@ export class EventSourcedRuntime {
 		return this.config.systemPrompt;
 	}
 
-	setSystemPrompt(prompt: string): void {
+	/**
+	 * Replace the system prompt. `silent: true` skips the USER_CONFIG_CHANGE
+	 * event — use it for per-turn transient injections (beforeAgentStart
+	 * hooks rebuild the prompt every turn), otherwise each turn persists the
+	 * full old+new prompt (~40KB) to the event log as fake user config churn.
+	 */
+	setSystemPrompt(prompt: string, options?: { silent?: boolean }): void {
 		const old_value = this.config.systemPrompt;
 		if (old_value === prompt) return;
 		this.config.systemPrompt = prompt;
+		if (options?.silent) return;
 		this.store.append({
 			actor_id: "user",
 			type: "USER_CONFIG_CHANGE",

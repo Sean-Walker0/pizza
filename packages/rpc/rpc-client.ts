@@ -4,6 +4,8 @@
  * Spawns the agent in RPC mode and provides a typed API for all operations.
  */
 
+import { COMPACTION_RPC_TIMEOUT_MS } from "@tomsun28/pizza-protocol";
+
 import { type ChildProcess, spawn } from "node:child_process";
 import type { AgentMessage, ThinkingLevel } from "../../src/core/agent/types.js";
 import type { ImageContent } from "@earendil-works/pi-ai/compat";
@@ -57,6 +59,9 @@ export interface ModelInfo {
 }
 
 export type RpcEventListener = (event: EventBase) => void;
+
+/** Keep at most this many bytes of child stderr in memory (tail). */
+const STDERR_TAIL_CAP = 64 * 1024;
 
 // ============================================================================
 // RPC Client
@@ -119,9 +124,14 @@ export class RpcClient {
 			this.pendingRequests.clear();
 		});
 
-		// Collect stderr for debugging
+		// Collect stderr for debugging — keep only the tail. Pooled agents
+		// run for days and log continuously; an unbounded string would
+		// leak memory inside the gateway process.
 		this.process.stderr?.on("data", (data) => {
 			this.stderr += data.toString();
+			if (this.stderr.length > STDERR_TAIL_CAP) {
+				this.stderr = this.stderr.slice(-STDERR_TAIL_CAP);
+			}
 			process.stderr.write(data);
 		});
 
@@ -537,7 +547,7 @@ export class RpcClient {
 	 * gateway multiplexer can forward arbitrary frames without a per-command
 	 * typed wrapper.
 	 */
-	async sendCommand(command: RpcCommand, timeoutMs = 30_000): Promise<RpcResponse> {
+	async sendCommand(command: RpcCommand, timeoutMs = command.type === "compact" ? COMPACTION_RPC_TIMEOUT_MS : 30_000): Promise<RpcResponse> {
 		if (!this.process?.stdin) {
 			throw new Error("Client not started");
 		}

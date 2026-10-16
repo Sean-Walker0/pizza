@@ -74,6 +74,7 @@ import type {
 } from "../../src/core/intent/types.js";
 import type { ModeEvent } from "../../src/modes/event-mapper.js";
 import { mapTypedEventToModeEvents } from "../../src/modes/event-mapper.js";
+import { estimateContextUsage } from "../../src/core/facade/extension-binding.js";
 import type { EventBase } from "../../src/core/event-store/types.js";
 import type {
   ExtensionCommandContext,
@@ -94,6 +95,7 @@ import {
   KeybindingsManager,
 } from "../../src/core/commands/keybindings.js";
 import { computeMessageStats } from "../../src/core/session/session-stats.js";
+import { EventStoreExtensionSessionManager } from "../../src/core/extensions/session-context.js";
 import { createCompactionSummaryMessage } from "../../src/core/context/messages.js";
 import {
   defaultModelPerProvider,
@@ -117,10 +119,6 @@ import {
   type SessionEntry,
   type SessionTreeNode,
 } from "../../src/core/types/session-types.js";
-import {
-  listWorkspaceSessions,
-  listAllSessions,
-} from "../../src/core/session/session-listing.js";
 import { BUILTIN_SLASH_COMMANDS } from "../../src/core/commands/slash-commands.js";
 import type { SourceInfo } from "../../src/core/skills/source-info.js";
 import type { TruncationResult } from "../../src/core/tools/truncate.js";
@@ -308,6 +306,10 @@ export class InteractiveMode {
   private _isCompacting = false;
   private _retryAttempt = 0;
   private _streamingText = "";
+  /** Markdown rebuilds are O(content) — throttle streaming repaints so a
+   * fast LLM stream doesn't spend all of main-thread time re-parsing. */
+  private _streamRenderAt = 0;
+  private _streamRenderPending: ReturnType<typeof setTimeout> | undefined;
   private ui!: TUI;
   private chatContainer!: Container;
   private pendingMessagesContainer!: Container;
@@ -464,23 +466,11 @@ export class InteractiveMode {
 
   private getContextUsageFacade() {
     const model = this.getCurrentModelFromFacade();
-    const contextWindow = (model as any)?.contextWindow ?? 0;
-    if (contextWindow <= 0) return undefined;
     const messages = this.facade.getProjection().buildContext().messages;
-    const tokens = messages.reduce((sum, msg) => {
-      const content = (msg as any).content;
-      const text =
-        typeof content === "string"
-          ? content
-          : Array.isArray(content)
-            ? content
-                .filter((c: any) => c.type === "text")
-                .map((c: any) => c.text)
-                .join("")
-            : "";
-      return sum + Math.ceil(text.length / 4);
-    }, 0);
-    return { tokens, contextWindow, percent: (tokens / contextWindow) * 100 };
+    // Shared estimator: uses the last assistant's provider-reported usage
+    // (accurate), falls back to CJK-aware per-message estimates, and treats
+    // a stale pre-compaction usage as invalid.
+    return estimateContextUsage(model as any, messages as any);
   }
 
   // ── Method wrappers ──────────────────────────────────
@@ -680,8 +670,6 @@ export class InteractiveMode {
     return this.facade.settingsManager;
   }
   private getExtensionSessionManager() {
-    const { EventStoreExtensionSessionManager } =
-      require("../../src/core/extensions/session-context.js") as typeof import("../../src/core/extensions/session-context.js");
     return new EventStoreExtensionSessionManager({
       store: this.facade.runtime.store,
       projection: this.facade.getProjection(),
@@ -823,27 +811,8 @@ export class InteractiveMode {
       },
       getContextUsage: () => {
         const facadeModel = this.getCurrentModelFromFacade();
-        const contextWindow = facadeModel?.contextWindow ?? 0;
-        if (contextWindow <= 0) return undefined;
         const messages = facade.getProjection().buildContext().messages;
-        const tokens = messages.reduce((sum, msg) => {
-          const content = "content" in msg ? msg.content : undefined;
-          const text =
-            typeof content === "string"
-              ? content
-              : Array.isArray(content)
-                ? content
-                    .filter((c) => c.type === "text")
-                    .map((c) => c.text)
-                    .join("")
-                : "";
-          return sum + Math.ceil(text.length / 4);
-        }, 0);
-        return {
-          tokens,
-          contextWindow,
-          percent: (tokens / contextWindow) * 100,
-        };
+        return estimateContextUsage(facadeModel as any, messages as any);
       },
       getCwd: () => facade.runtime.cwd,
       isUsingOAuthSubscription: () => {
@@ -3093,6 +3062,25 @@ export class InteractiveMode {
   ): Promise<void> {
     return this.facade.prompt(text, images as any);
   }
+  /** Render the accumulated streaming text into the streaming component. */
+  private _renderStreamingText(): void {
+    if (!this.streamingComponent) return;
+    const streamingMsg = {
+      role: "assistant" as const,
+      content: [{ type: "text" as const, text: this._streamingText }],
+      stopReason: null as any,
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: { total: 0 },
+      },
+    } as AssistantMessage;
+    this.streamingComponent.updateContent(streamingMsg);
+    this.ui.requestRender();
+  }
+
   private subscribeToAgent(): void {
     this.subscribeToFacade();
   }
@@ -3198,6 +3186,10 @@ export class InteractiveMode {
           this.updatePendingMessagesDisplay();
         } else if (msg.role === "assistant") {
           if (this.streamingComponent) {
+            if (this._streamRenderPending) {
+              clearTimeout(this._streamRenderPending);
+              this._streamRenderPending = undefined;
+            }
             this.streamingMessage = msg as AssistantMessage;
             this.streamingComponent.updateContent(this.streamingMessage);
 
@@ -3273,21 +3265,20 @@ export class InteractiveMode {
       case "streaming_message_updated": {
         if (event.delta) {
           this._streamingText += event.delta;
-          // Re-render the streaming component with accumulated text
-          if (this.streamingComponent) {
-            const streamingMsg = {
-              role: "assistant" as const,
-              content: [{ type: "text" as const, text: this._streamingText }],
-              stopReason: null as any,
-              usage: {
-                input: 0,
-                output: 0,
-                cacheRead: 0,
-                cacheWrite: 0,
-                cost: { total: 0 },
-              },
-            } as AssistantMessage;
-            this.streamingComponent.updateContent(streamingMsg);
+          // Re-render the streaming component with accumulated text —
+          // throttled: updateContent() rebuilds the whole Markdown tree per
+          // call (O(content length) → O(n²) per response). ~30fps is
+          // indistinguishable to the eye but bounds the cost.
+          const now = Date.now();
+          if (this.streamingComponent && now - this._streamRenderAt >= 33) {
+            this._streamRenderAt = now;
+            this._renderStreamingText();
+          } else if (this.streamingComponent && !this._streamRenderPending) {
+            this._streamRenderPending = setTimeout(() => {
+              this._streamRenderPending = undefined;
+              this._streamRenderAt = Date.now();
+              this._renderStreamingText();
+            }, 33);
           }
         }
         this.ui.requestRender();

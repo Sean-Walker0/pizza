@@ -5,6 +5,7 @@
  * and after compaction the session is reloaded.
  */
 
+import { estimateStringTokens } from "./token-estimation.js";
 import type { AgentMessage } from "../agent/types.js";
 import type { AssistantMessage, Usage } from "@earendil-works/pi-ai/compat";
 import type { SessionEntry } from "../types/session-types.js";
@@ -122,8 +123,42 @@ const STALE_USAGE_RATIO = 1.5;
  * Falls back to full char/4 estimation when the provider-reported usage appears stale
  * (e.g. after a session fork that merged in messages from a different context).
  */
+/**
+ * Memoized per messages-array identity — the estimate depends only on the
+ * array contents, and callers (footer render, get_state, compaction check)
+ * pass the same cached BuiltContext.messages until new events land.
+ */
+const estimateCache = new WeakMap<AgentMessage[], ContextUsageEstimate>();
+
 export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEstimate {
+	const cached = estimateCache.get(messages);
+	if (cached) return cached;
+	const result = computeContextTokens(messages);
+	estimateCache.set(messages, result);
+	return result;
+}
+
+function computeContextTokens(messages: AgentMessage[]): ContextUsageEstimate {
 	const usageInfo = getLastAssistantUsageInfo(messages);
+
+	// A compaction/branch summary whose timestamp is >= the last assistant
+	// message's means that usage was recorded BEFORE the summary was written
+	// — its totalTokens describe the pre-compaction context, not the current
+	// one. The kept assistant messages sit after the summary in the flattened
+	// list, so index comparisons can't see this; timestamps can (>= because
+	// same-millisecond appends are common in fast sequences). Fall back to
+	// full estimation (summary + prefix + kept pairs) so the UI stops
+	// reporting the pre-compaction size after a compact.
+	if (usageInfo) {
+		const usageTs = messages[usageInfo.index]!.timestamp;
+		for (const m of messages) {
+			if ((m.role === "compactionSummary" || m.role === "branchSummary") && m.timestamp >= usageTs) {
+				let estimated = 0;
+				for (const msg of messages) estimated += estimateTokens(msg);
+				return { tokens: estimated, usageTokens: 0, trailingTokens: estimated, lastUsageIndex: null };
+			}
+		}
+	}
 
 	if (!usageInfo) {
 		let estimated = 0;
@@ -188,7 +223,14 @@ export function shouldCompact(contextTokens: number, contextWindow: number, sett
 // ============================================================================
 
 /**
- * Estimate token count for a message using chars/4 heuristic.
+ * Estimate tokens in a string. ASCII is ~4 chars/token; CJK/emoji run
+ * close to 1-2 chars/token, so a flat chars/4 halves or thirds the real
+ * count on CJK-heavy sessions. Shared rule with the compaction engine.
+ */
+export { estimateStringTokens } from "./token-estimation.js";
+
+/**
+ * Estimate token count for a message using a chars/token heuristic.
  * This is conservative (overestimates tokens).
  */
 export function estimateTokens(message: AgentMessage): number {
@@ -198,53 +240,54 @@ export function estimateTokens(message: AgentMessage): number {
 		case "user": {
 			const content = (message as { content: string | Array<{ type: string; text?: string }> }).content;
 			if (typeof content === "string") {
-				chars = content.length;
+				return estimateStringTokens(content);
 			} else if (Array.isArray(content)) {
+				let tokens = 0;
 				for (const block of content) {
 					if (block.type === "text" && block.text) {
-						chars += block.text.length;
+						tokens += estimateStringTokens(block.text);
 					}
 				}
+				return tokens;
 			}
-			return Math.ceil(chars / 4);
+			return 0;
 		}
 		case "assistant": {
 			const assistant = message as AssistantMessage;
+			let tokens = 0;
 			for (const block of assistant.content) {
 				if (block.type === "text") {
-					chars += block.text.length;
+					tokens += estimateStringTokens(block.text);
 				} else if (block.type === "thinking") {
-					chars += block.thinking.length;
+					tokens += estimateStringTokens(block.thinking);
 				} else if (block.type === "toolCall") {
-					chars += block.name.length + JSON.stringify(block.arguments).length;
+					tokens += estimateStringTokens(block.name) + estimateStringTokens(JSON.stringify(block.arguments));
 				}
 			}
-			return Math.ceil(chars / 4);
+			return tokens;
 		}
 		case "custom":
 		case "toolResult": {
 			if (typeof message.content === "string") {
-				chars = message.content.length;
-			} else {
-				for (const block of message.content) {
-					if (block.type === "text" && block.text) {
-						chars += block.text.length;
-					}
-					if (block.type === "image") {
-						chars += 4800; // Estimate images as 4000 chars, or 1200 tokens
-					}
+				return estimateStringTokens(message.content);
+			}
+			let tokens = 0;
+			for (const block of message.content) {
+				if (block.type === "text" && block.text) {
+					tokens += estimateStringTokens(block.text);
+				}
+				if (block.type === "image") {
+					tokens += 1200;
 				}
 			}
-			return Math.ceil(chars / 4);
+			return tokens;
 		}
 		case "bashExecution": {
-			chars = message.command.length + message.output.length;
-			return Math.ceil(chars / 4);
+			return estimateStringTokens(message.command) + estimateStringTokens(message.output);
 		}
 		case "branchSummary":
 		case "compactionSummary": {
-			chars = message.summary.length;
-			return Math.ceil(chars / 4);
+			return estimateStringTokens(message.summary);
 		}
 	}
 

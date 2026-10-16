@@ -33,6 +33,8 @@
  *   onCompactionRequested  — compaction orchestration
  */
 
+import { compactWithDeadline } from "./compaction-deadline.js";
+
 import type { EventBase, EventType } from "../event-store/types.js";
 import { generateRunId, TurnState, type FollowUpEntry, type TurnTracker } from "./turn-state.js";
 import type { EventStore, EventAppendInput } from "../event-store/store.js";
@@ -71,6 +73,8 @@ export interface ReactorConfig {
 	systemPrompt: string;
 	model: { provider: string; model_id: string; thinking_level?: string };
 	contextBudget: number;
+	/** Dynamic budget for all LLM rounds in a live reactor. */
+	getContextBudget?: () => number;
 	/** Tool definitions exposed to the LLM */
 	tools: ToolDefinition[];
 	/** Retry policy (default: DefaultRetryPolicy). */
@@ -88,6 +92,14 @@ export interface ReactorConfig {
 	 * Returns the updated system prompt string.
 	 */
 	refreshSystemPrompt?: () => string;
+	/**
+	 * Reports the provider-observed prompt size for each successful LLM call
+	 * (input + cache_read + cache_write — the tokens actually present in the
+	 * context). Lets the runtime self-correct a too-small contextBudget when
+	 * the model catalog understates the window (observed: swe-2 catalog says
+	 * 262k but serves 440k+ prompts without error).
+	 */
+	onObservedContextTokens?: (tokens: number) => void;
 	/**
 	 * Run at the start of each user-prompt turn, before the first LLM round.
 	 * Lets the caller fire extension before_agent_start hooks (system-prompt
@@ -211,6 +223,23 @@ export class Reactor {
 	 */
 	private _streamIdleTimeoutMs = 10 * 60_000;
 	private _streamIdleTimer: ReturnType<typeof setTimeout> | undefined;
+	/** Per-LLM-call abort controller: the stream-idle watchdog aborts this so a
+	 * hung stream fails the call (LLM_CALL_FAILED → retry path) WITHOUT
+	 * poisoning the turn-level abortController — aborting the shared
+	 * controller would make _shouldInterrupt() return true afterwards,
+	 * silently turning a recoverable stream stall into a user-visible abort. */
+	private _llmCallAbort: AbortController | undefined;
+	/** Set when the watchdog (not the user) aborted the in-flight call. */
+	private _streamIdleTimedOut = false;
+	/**
+	 * Rate-limit TOOL_EXECUTION_UPDATE emissions per tool call. The update
+	 * event is persisted to the store, so an unthrottled onUpdate means one
+	 * SQLite insert (+ full tail-string JSON) per output chunk — chatty
+	 * commands wrote thousands of rows per call. UI consumers only need the
+	 * latest state; intermediate updates inside this window are dropped.
+	 */
+	private _lastToolUpdateAt = new Map<string, number>();
+	private static readonly TOOL_UPDATE_MIN_INTERVAL_MS = 120;
 	constructor(config: ReactorConfig) {
 		this.config = config;
 		this.retryPolicy = config.retryPolicy ?? new DefaultRetryPolicy();
@@ -277,12 +306,20 @@ export class Reactor {
 	/** Stop the reactor. Clears all subscriptions. */
 	stop(): void {
 		this._isRunning = false;
+		this._stopStreamIdleWatchdog();
+		this._llmCallAbort?.abort();
 		this.abortController?.abort();
+		this._stopStreamIdleWatchdog();
 		for (const { timeout } of this.retryTimers.values()) {
 			clearTimeout(timeout);
 		}
 		this.retryTimers.clear();
 		this._drainPendingApprovals();
+		// Trackers for tool batches aborted mid-flight can never complete —
+		// clear them so the shared TurnState does not leak entries across
+		// reactor restarts (this instance is discarded after each prompt cycle).
+		this.turnTrackers.clear();
+		this._lastToolUpdateAt.clear();
 		for (const unsub of this.unsubscribers) unsub();
 		this.unsubscribers = [];
 	}
@@ -454,7 +491,25 @@ export class Reactor {
 
 	private async _onUserMessage(event: EventBase): Promise<void> {
 		const payload = event.payload as { content: unknown; images?: unknown };
-		if (this._shouldInterrupt()) return;
+		if (this._shouldInterrupt()) {
+			// The controller is aborted but no turn has settled yet (message
+			// landed in the abort→completion window). Queue it so the turn-
+			// completion drain delivers it after the abort unwinds — dropping
+			// it would lose a user message that is already in the log.
+			this._emit({
+				actor_id: "user",
+				type: "USER_FOLLOWUP_QUEUED",
+				payload: {
+					content: payload.content,
+					images: payload.images,
+					reason: "abort_in_flight",
+					user_message_event_id: event.event_id,
+					run_id: this.turnState.runId,
+				},
+				caused_by: event.event_id,
+			});
+			return;
+		}
 
 		// A turn is already in flight (LLM streaming, tool running, retry
 		// pending, or compaction): starting another reactor turn here would
@@ -656,7 +711,7 @@ export class Reactor {
 
 		// Build context from projection
 		let context = this.config.projection.buildContext({
-			max_tokens: this.config.contextBudget,
+			max_tokens: this.config.getContextBudget?.() ?? this.config.contextBudget,
 		});
 
 		// An empty-answer retry gets a transient nudge appended to the context.
@@ -699,7 +754,7 @@ export class Reactor {
 	private async _onLlmCallRequested(event: EventBase): Promise<void> {
 		if (this._shouldInterrupt()) return;
 
-		const context = this._pendingContext ?? this.config.projection.buildContext({ max_tokens: this.config.contextBudget });
+		const context = this._pendingContext ?? this.config.projection.buildContext({ max_tokens: this.config.getContextBudget?.() ?? this.config.contextBudget });
 		this._pendingContext = undefined;
 
 		// Emit AGENT_MESSAGE_START up front so chunks have a parent in the causal chain.
@@ -714,32 +769,58 @@ export class Reactor {
 			// Start the stream-idle watchdog. It fires if no chunk arrives
 			// within the timeout window, aborting the hung LLM call so the
 			// reactor emits LLM_CALL_FAILED instead of hanging forever.
+			this._streamIdleTimedOut = false;
 			this._startStreamIdleWatchdog();
-			const response = await this.config.llmClient.complete({
-				messages: context.messages,
-				systemPrompt: this.config.systemPrompt,
-				model: this.config.model,
-				tools: this.config.tools,
-				signal: this.abortController?.signal,
-				onChunk: (chunk: LLMChunk) => {
-					// Reset the idle timer on each chunk — the stream is alive.
-					this._resetStreamIdleWatchdog();
-					// Translate LLMChunk into an AGENT_MESSAGE_CHUNK event so projections / UI
-					// can render the streaming response in real time.
-					this._emit({
-						actor_id: "coder_agent",
-						type: "AGENT_MESSAGE_CHUNK",
-						payload: { chunk: chunk as any },
-						caused_by: msgStart.event_id,
-					});
-				},
-			});
+			// Per-call abort: aborts when the turn aborts (user interrupt,
+			// reactor stop) or when the stream-idle watchdog fires — without
+			// marking the turn-level signal aborted.
+			const callAbort = new AbortController();
+			this._llmCallAbort = callAbort;
+			const parentSignal = this.abortController?.signal;
+			const abortCall = () => callAbort.abort();
+			if (parentSignal) {
+				if (parentSignal.aborted) callAbort.abort();
+				else parentSignal.addEventListener("abort", abortCall, { once: true });
+			}
+			let response: LLMResponse;
+			try {
+				response = await this.config.llmClient.complete({
+					messages: context.messages,
+					systemPrompt: this.config.systemPrompt,
+					model: this.config.model,
+					tools: this.config.tools,
+					signal: callAbort.signal,
+					onChunk: (chunk: LLMChunk) => {
+						// Reset the idle timer on each chunk — the stream is alive.
+						this._resetStreamIdleWatchdog();
+						// Translate LLMChunk into an AGENT_MESSAGE_CHUNK event so projections / UI
+						// can render the streaming response in real time.
+						this._emit({
+							actor_id: "coder_agent",
+							type: "AGENT_MESSAGE_CHUNK",
+							payload: { chunk: chunk as any },
+							caused_by: msgStart.event_id,
+						});
+					},
+				});
+			} finally {
+				parentSignal?.removeEventListener("abort", abortCall);
+			}
 
 			this._stopStreamIdleWatchdog();
+			this._llmCallAbort = undefined;
 			this._handleLlmResponse(response, event.event_id, msgStart.event_id);
 		} catch (err) {
 			this._stopStreamIdleWatchdog();
-			const msg = err instanceof Error ? err.message : String(err);
+			this._llmCallAbort = undefined;
+			let msg = err instanceof Error ? err.message : String(err);
+			// Watchdog abort: turn the opaque AbortError into a meaningful,
+			// retryable failure — "aborted" matches no retryable pattern and
+			// would otherwise surface to the user as a cryptic turn error.
+			if (this._streamIdleTimedOut) {
+				this._streamIdleTimedOut = false;
+				msg = `LLM stream idle for ${this._streamIdleTimeoutMs}ms — connection stalled, timed out`;
+			}
 			const isRetryable = this.retryPolicy.isRetryable({ message: msg });
 
 			this._emit({
@@ -761,10 +842,13 @@ export class Reactor {
 		if (this._streamIdleTimer) clearTimeout(this._streamIdleTimer);
 		this._streamIdleTimer = setTimeout(() => {
 			this._streamIdleTimer = undefined;
-			// Abort the in-flight LLM call. This causes the `await` in
-			// _onLlmCallRequested to reject with an AbortError, which flows
-			// into the catch block and emits LLM_CALL_FAILED.
-			this.abortController?.abort();
+			this._streamIdleTimedOut = true;
+			// Abort ONLY the in-flight LLM call (never the turn controller).
+			// The `await` in _onLlmCallRequested rejects with an AbortError,
+			// which flows into the catch block and emits LLM_CALL_FAILED —
+			// where the retry policy can still apply, since the turn-level
+			// abort signal remains un-aborted.
+			this._llmCallAbort?.abort();
 		}, this._streamIdleTimeoutMs);
 	}
 
@@ -789,6 +873,11 @@ export class Reactor {
 			});
 			msgStartEventId = started.event_id;
 		}
+
+		// Report the provider-observed context size so an understated model
+		// contextWindow can self-correct (see ReactorConfig.onObservedContextTokens).
+		const observedContextTokens = response.usage.input + response.usage.cache_read + response.usage.cache_write;
+		if (observedContextTokens > 0) this.config.onObservedContextTokens?.(observedContextTokens);
 
 		// Emit message end (the chunking is optional; for now we skip to end for simplicity)
 		const toolCalls = extractToolCalls(response.content);
@@ -1024,9 +1113,11 @@ export class Reactor {
 					this._emitToolExecutionUpdate(tool_call_id, partial, causedBy);
 				},
 			});
+			this._lastToolUpdateAt.delete(tool_call_id);
 			this._emitToolExecutionEnd(tool_call_id, tool_name, result, causedBy, startTime);
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
+			this._lastToolUpdateAt.delete(tool_call_id);
 			this._emitToolExecutionEnd(tool_call_id, tool_name, {
 				content: [{ type: "text", text: msg }],
 				is_error: true,
@@ -1040,6 +1131,13 @@ export class Reactor {
 		partial: ToolExecutionUpdate,
 		causedBy: string,
 	): void {
+		// Drop updates that arrive faster than the throttle window (per tool
+		// call). The final tool result always goes out via TOOL_EXECUTION_END,
+		// so no state is lost — only intermediate redraws/persists coalesce.
+		const now = Date.now();
+		const last = this._lastToolUpdateAt.get(tool_call_id);
+		if (last !== undefined && now - last < Reactor.TOOL_UPDATE_MIN_INTERVAL_MS) return;
+		this._lastToolUpdateAt.set(tool_call_id, now);
 		this._emit({
 			actor_id: "runtime",
 			type: "TOOL_EXECUTION_UPDATE",
@@ -1134,6 +1232,11 @@ export class Reactor {
 		const tracker = assistantMessageEventId ? this.turnTrackers.get(assistantMessageEventId) : undefined;
 
 		if (!tracker || !assistantMessageEventId) return;
+		// Ignore END events for tool calls that do not belong to this turn
+		// (duplicate ids across providers, or a compensating crash-recovery END
+		// arriving after the turn already aggregated): counting them would push
+		// `received` past expectedCount with foreign results.
+		if (!tracker.expectedToolCallIds.has(payload.tool_call_id)) return;
 		if (tracker.received.some((result) => result.tool_call_id === payload.tool_call_id)) return;
 
 		tracker.received.push({
@@ -1255,6 +1358,12 @@ export class Reactor {
 		// The turn is over from the reactor's perspective. If a queued follow-up is
 		// delivered below, its USER_MESSAGE handler re-sets this to true synchronously.
 		this._turnInFlight = false;
+		// Drop trackers for aborted/incomplete turns: their remaining
+		// TOOL_EXECUTION_ENDs may never arrive (aborted mid-flight) and any late
+		// arrival must not resurrect the aggregate path for a dead turn.
+		if (payload.reason === "aborted") {
+			this.turnTrackers.clear();
+		}
 		this._emptyAnswerRetries = 0;
 
 		// If abort() was called, discard any pending follow-ups so the reactor stops.
@@ -1525,7 +1634,7 @@ export class Reactor {
 		});
 
 		try {
-			const outcome = await this.compactionPolicy.compact(payload.reason, abortController.signal);
+			const outcome = await compactWithDeadline(this.compactionPolicy, payload.reason, abortController);
 			this._emit({
 				actor_id: "compactor",
 				type: "COMPACTION_END",
@@ -1539,7 +1648,7 @@ export class Reactor {
 					actor_id: "compactor",
 					type: "COMPACTION_ABORTED",
 					payload: {
-						reason: "user_cancelled",
+						reason: abortController.signal.reason?.name === "TimeoutError" ? "timeout" : "user_cancelled",
 						message: msg,
 						token_count: payload.token_count,
 					},

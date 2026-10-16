@@ -87,6 +87,8 @@ export class TurnState {
 	readonly retryTimers = new Map<string, RetryTimer>();
 	readonly turnTrackers = new Map<string, TurnTracker>();
 	readonly pendingApprovals = new Map<string, PendingApproval>();
+	/** Stable log boundary for this run, including across replay pages. */
+	private replayRunStartSequence: number | undefined;
 
 	/** Turn loop-detection signatures for the current prompt cycle. */
 	toolRoundSignatures: string[][] = [];
@@ -257,21 +259,44 @@ export class TurnState {
 	 * concurrent processes on the same workspace).
 	 */
 	replayFollowUpsFromLog(store: EventStore): FollowUpEntry[] {
-		const followups = store.query({ types: ["USER_FOLLOWUP_QUEUED"] });
+		// Only this run's events can carry a live follow-up buffer: entries
+		// queued before OUR run's RUNTIME_STARTED belong to a dead process run.
+		// Scope every scan to events after it — a long-lived workspace log
+		// would otherwise be fully re-scanned on every prompt. We locate OUR
+		// RUNTIME_STARTED by run_id (a concurrent runtime's STARTED must not
+		// shrink the scope and strand our queue). Legacy fallback still uses
+		// the newest STARTED for the undated-entry cutoff.
+		const startedEvents = store.query({ types: ["RUNTIME_STARTED"], reverse: true, limit: 100 });
+		const lastStarted = startedEvents[0];
+		if (this.replayRunStartSequence === undefined) {
+			let page = startedEvents;
+			let ourStarted = page.find((e) => runIdOf(e) === this.runId);
+			// Other live runtimes may have produced more than one page of boot
+			// events. Never substitute their start for ours and strand our queue.
+			while (!ourStarted && page.length === 100) {
+				page = store.query({ types: ["RUNTIME_STARTED"], reverse: true, limit: 100, before_sequence: page[page.length - 1]!.sequence });
+				ourStarted = page.find((e) => runIdOf(e) === this.runId);
+			}
+			if (ourStarted) this.replayRunStartSequence = ourStarted.sequence;
+		}
+		const runStartSeq = this.replayRunStartSequence ?? 0;
+		const scope = { after_sequence: runStartSeq } as const;
+
+		const followups = store.query({ types: ["USER_FOLLOWUP_QUEUED"], ...scope });
 		if (followups.length === 0) return [];
 
 		// Delivered: a USER_MESSAGE or AGENT_TURN_REQUESTED carries the
 		// follow-up event id as caused_by (delivery shapes — see reactor).
 		const deliveredCausedBy = new Set(
 			store
-				.query({ types: ["USER_MESSAGE", "AGENT_TURN_REQUESTED"] })
+				.query({ types: ["USER_MESSAGE", "AGENT_TURN_REQUESTED"], ...scope })
 				.map((m) => m.caused_by)
 				.filter((id): id is string => !!id),
 		);
 
 		// Dropped: USER_FOLLOWUP_DROPPED lists abandoned queue entries.
 		const droppedIds = new Set<string>();
-		for (const d of store.query({ types: ["USER_FOLLOWUP_DROPPED"] })) {
+		for (const d of store.query({ types: ["USER_FOLLOWUP_DROPPED"], ...scope })) {
 			const p = d.payload as { dropped_event_ids?: string[] };
 			for (const id of p.dropped_event_ids ?? []) droppedIds.add(id);
 		}
@@ -292,7 +317,6 @@ export class TurnState {
 			if (p.run_id !== undefined) {
 				if (p.run_id !== this.runId) continue;
 			} else {
-				const lastStarted = store.query({ types: ["RUNTIME_STARTED"], reverse: true, limit: 1 })[0];
 				if (lastStarted && f.sequence < lastStarted.sequence) continue;
 			}
 			const entry: FollowUpEntry = {

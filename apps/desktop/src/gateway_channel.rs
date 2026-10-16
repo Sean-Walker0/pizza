@@ -37,10 +37,14 @@ impl<T: Read + Write> ReadWrite for T {}
 /// numbers defeat the version-mismatch restart — leaving fresh dev code
 /// talking to a stale production binary.
 pub fn gateway_socket_path() -> Option<PathBuf> {
+	socket_path_for(cfg!(debug_assertions))
+}
+
+fn socket_path_for(dev: bool) -> Option<PathBuf> {
 	#[cfg(unix)]
 	{
 		let home = std::env::var("HOME").ok()?;
-		let name = if cfg!(debug_assertions) {
+		let name = if dev {
 			"gateway-dev.sock"
 		} else {
 			"gateway.sock"
@@ -49,7 +53,7 @@ pub fn gateway_socket_path() -> Option<PathBuf> {
 	}
 	#[cfg(windows)]
 	{
-		Some(PathBuf::from(if cfg!(debug_assertions) {
+		Some(PathBuf::from(if dev {
 			r"\\.\pipe\gateway-dev"
 		} else {
 			r"\\.\pipe\gateway"
@@ -109,6 +113,14 @@ pub struct GatewayChannel {
 	/// Tears the connection down so the blocked reader thread exits (and the
 	/// gateway sees the disconnect) instead of leaking a zombie subscriber.
 	closer: Arc<dyn Fn() + Send + Sync>,
+}
+
+/// Long model calls need room beyond the agent's own five-minute deadline.
+pub(crate) fn rpc_timeout(frame: &Value) -> std::time::Duration {
+	std::time::Duration::from_secs(match frame.get("type").and_then(Value::as_str) {
+		Some("compact") => 320,
+		_ => 60,
+	})
 }
 
 impl GatewayChannel {
@@ -362,7 +374,7 @@ impl GatewayChannel {
 			.unwrap()
 			.insert(id.clone(), Arc::clone(&slot));
 		// The deadline covers the write too (bounded by WRITE_TIMEOUT).
-		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+		let deadline = std::time::Instant::now() + rpc_timeout(&frame);
 		if let Err(e) =
 			self.write_line(&json!({ "type": "rpc", "workspace": workspace, "frame": frame }))
 		{
@@ -517,6 +529,9 @@ pub fn ensure_gateway(
 	if crate::updater::is_installing() {
 		return Err("Pizza is installing an update; the gateway will restart afterwards".into());
 	}
+	if cfg!(debug_assertions) {
+		take_over_from_production_gateway(socket_path);
+	}
 	// Fast path: ping an existing gateway.
 	if gateway_ready(socket_path) {
 		// Version check: if the caller knows its version and the running
@@ -650,6 +665,34 @@ pub fn ensure_gateway(
 		"Gateway failed to start within 15s (socket: {})",
 		socket_path.display()
 	))
+}
+
+/// Debug builds: the dev gateway has its own socket but shares the main
+/// agent lock (`~/.pizza/main/.lock`) and channel adapters (bot tokens) with
+/// the production gateway. With both alive, the dev gateway's main agent
+/// dies on the lock ("Agent process stopped") and bots fight (Telegram 409).
+/// Dev takes over: let busy production agents finish (up to 30s), then stop
+/// the production gateway gracefully.
+fn take_over_from_production_gateway(dev_socket: &PathBuf) {
+	let Some(prod) = socket_path_for(false) else {
+		return;
+	};
+	if &prod == dev_socket || !gateway_ready(&prod) {
+		return;
+	}
+	crate::bridge::log_file(&format!(
+		"take_over_from_production_gateway: stopping production gateway at {}",
+		prod.display()
+	));
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+	while busy_agent_count(&prod).unwrap_or(0) > 0 && std::time::Instant::now() < deadline {
+		std::thread::sleep(std::time::Duration::from_secs(1));
+	}
+	let stopped = shutdown_gateway(&prod);
+	crate::bridge::log_file(&format!(
+		"take_over_from_production_gateway: stopped={}",
+		stopped
+	));
 }
 
 /// Parsed `status_result` from the gateway — just the fields we need for the
@@ -1071,6 +1114,15 @@ mod _unsupported_stub {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn compaction_deadline_exceeds_agent_deadline_without_slowing_regular_rpc() {
+		assert!(rpc_timeout(&json!({"type": "compact"})) > std::time::Duration::from_secs(310));
+		assert_eq!(
+			rpc_timeout(&json!({"type": "get_state"})),
+			std::time::Duration::from_secs(60)
+		);
+	}
 
 	#[test]
 	fn dispatch_routes_response_by_id_and_events_to_inbox() {
