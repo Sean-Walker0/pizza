@@ -17,8 +17,6 @@ export interface PetSave {
 	speciesId: string;
 	xp: number;
 	adoptedAt: number;
-	/** Whether the widget is shown below the editor (default true). */
-	visible?: boolean;
 	/** Written by the desktop app: floating window open across restarts. */
 	floating?: boolean;
 	[key: string]: unknown;
@@ -50,7 +48,6 @@ export function loadPetSave(): PetSave | undefined {
 			speciesId: data.speciesId,
 			xp: typeof data.xp === "number" ? data.xp : 0,
 			adoptedAt: typeof data.adoptedAt === "number" ? data.adoptedAt : Date.now(),
-			visible: data.visible !== false,
 		};
 	} catch {
 		return undefined;
@@ -67,7 +64,10 @@ export function savePet(save: PetSave): void {
 	} catch {
 		/* first save */
 	}
-	writeFileSync(petSavePath(), JSON.stringify({ ...onDisk, ...save }, null, 2), "utf-8");
+	// `floating` is owned by the desktop app (written on window open/close); the
+	// extension's in-memory copy can be stale — strip it so we never clobber it.
+	const { floating: _floating, ...rest } = save;
+	writeFileSync(petSavePath(), JSON.stringify({ ...onDisk, ...rest }, null, 2), "utf-8");
 }
 
 export function deletePetSave(): void {
