@@ -171,11 +171,15 @@ describe("browser policy: NavigationPolicy", () => {
 
 describe("chromium resolution", () => {
 	const previousEnv = process.env["PIZZA_BROWSER_EXECUTABLE"];
+	// os.homedir() reads HOME on unix but USERPROFILE on Windows — fake both
+	// so the agent-browser cache scan targets our temp dir everywhere.
 	const previousHome = process.env["HOME"];
+	const previousUserProfile = process.env["USERPROFILE"];
 	let fakeHome: string;
 
 	beforeAll(async () => {
 		fakeHome = await mkdtemp(path.join(tmpdir(), "pizza-browser-test-"));
+		process.env["USERPROFILE"] = fakeHome;
 		// Two CfT installs: an older 131 and a newer 137 — the newer must win.
 		const layouts =
 			process.platform === "darwin"
@@ -199,6 +203,8 @@ describe("chromium resolution", () => {
 	afterAll(async () => {
 		if (previousHome === undefined) delete process.env["HOME"];
 		else process.env["HOME"] = previousHome;
+		if (previousUserProfile === undefined) delete process.env["USERPROFILE"];
+		else process.env["USERPROFILE"] = previousUserProfile;
 		if (previousEnv === undefined) delete process.env["PIZZA_BROWSER_EXECUTABLE"];
 		else process.env["PIZZA_BROWSER_EXECUTABLE"] = previousEnv;
 		await rm(fakeHome, { recursive: true, force: true });
