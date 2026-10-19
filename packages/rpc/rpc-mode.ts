@@ -18,6 +18,7 @@ import type { AgentMessage } from "../../src/core/agent/types.js";
 import { estimateContextUsage } from "../../src/core/facade/extension-binding.js";
 import type { Api, Model } from "@earendil-works/pi-ai/compat";
 import { computeMessageStats, type SessionStats } from "../../src/core/session/session-stats.js";
+import { testModel } from "../../src/core/models/model-test.js";
 import type {
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
@@ -592,6 +593,7 @@ function getFacadeSessionState(facade: SessionFacade, ptyPort?: number): RpcSess
 	const tokenUsage = { totalInput, totalOutput, totalCacheRead, totalCacheWrite, totalCost };
 
 	return {
+		capabilities: { mcpManagement: true },
 		model: resolvedModel,
 		thinkingLevel: (facade.thinkingLevel ?? "off") as RpcSessionState["thinkingLevel"],
 		isStreaming: facade.isRunning,
@@ -886,6 +888,7 @@ export async function runRpcModeWithFacade(
 	};
 
 	const rpcUiContext: ExtensionUIContext = {
+	surface: "rpc",
 		select: async (title, options, opts) => {
 			const res = await requestUi({ method: "select", title, options, timeout: opts?.timeout }, opts?.timeout ? opts.timeout + 5000 : undefined);
 			return "value" in res ? res.value : undefined;
@@ -1157,6 +1160,16 @@ export async function runRpcModeWithFacade(
 					}))
 					.filter((m) => !command.authOnly || m.hasAuth);
 				return success(id, "get_available_models", { models, total: all.length });
+			}
+
+			case "test_model": {
+				const registry = facade.modelRegistry;
+				const model = registry?.find(command.provider, command.modelId);
+				if (!model) {
+					return error(id, "test_model", `Model not found: ${command.provider}/${command.modelId}`);
+				}
+				const result = await testModel(registry!, model);
+				return success(id, "test_model", result);
 			}
 
 			case "cycle_model": {
@@ -1602,6 +1615,22 @@ export async function runRpcModeWithFacade(
 			}
 		}
 
+		case "mcp_command": {
+			const runner = facade.extensionRunner;
+			const builtin = runner?.getAllRegisteredBuiltinCommands().find((item) => item.name === "_agentcli");
+			if (!runner || !builtin) return error(id, "mcp_command", "MCP extension is disabled. Enable it in Extensions first.");
+			if (!Array.isArray(command.args) || command.args.some((arg) => typeof arg !== "string")) {
+				return error(id, "mcp_command", "Expected an array of command arguments");
+			}
+			try {
+				const result = await builtin.execute(crypto.randomUUID(), builtin.parseArguments(command.args), undefined, undefined, runner.createContext());
+				const text = result.content.filter((item) => item.type === "text").map((item) => item.text).join("\n");
+				return success(id, "mcp_command", { text });
+			} catch (cause) {
+				return error(id, "mcp_command", cause instanceof Error ? cause.message : String(cause));
+			}
+		}
+
 		case "get_extensions": {
 			const extensions = await buildExtensionInfos(facade);
 			return success(id, "get_extensions", { extensions });
@@ -1962,7 +1991,7 @@ export async function runRpcModeWithFacade(
 
 			default: {
 				const unknownCommand = command as { type: string };
-				return error(undefined, unknownCommand.type, `Unknown command: ${unknownCommand.type}`);
+				return error(id, unknownCommand.type, `Unknown command: ${unknownCommand.type}`);
 			}
 		}
 	};

@@ -269,6 +269,18 @@ export interface ModelInfo {
 	hasAuth?: boolean;
 }
 
+/** Result of a one-shot model connectivity test (test_model RPC). */
+export interface ModelTestResult {
+	ok: boolean;
+	provider: string;
+	modelId: string;
+	/** First text snippet from the reply on success, else null. */
+	response?: string | null;
+	/** Human-readable failure reason. Absent/null on success. */
+	error?: string | null;
+	latencyMs: number;
+}
+
 // ============================================================================
 // RPC Commands (stdin)
 // ============================================================================
@@ -292,6 +304,10 @@ export type RpcCommand =
 	| { id?: string; type: "cycle_model" }
 	/** authOnly: return only models with configured auth (the registry holds ~1.6k models, ~260KB). */
 	| { id?: string; type: "get_available_models"; authOnly?: boolean }
+	/** One-shot connectivity test: send a tiny "hi" through the real auth/compat
+	 *  pipeline and report latency + reply snippet. Used by the settings UI's
+	 *  per-model test buttons. */
+	| { id?: string; type: "test_model"; provider: string; modelId: string }
 
 	// Thinking
 	| { id?: string; type: "set_thinking_level"; level: ThinkingLevel }
@@ -356,6 +372,7 @@ export type RpcCommand =
 	| { id?: string; type: "set_skill_enabled"; skillName: string; enabled: boolean }
 	| { id?: string; type: "delete_skill"; skillName: string }
 	| { id?: string; type: "install_skill"; source: string; slug: string }
+	| { id?: string; type: "mcp_command"; args: string[] }
 	| { id?: string; type: "get_extensions" }
 	| { id?: string; type: "get_extension_menus" }
 	| { id?: string; type: "get_themes" }
@@ -581,6 +598,8 @@ export interface RpcExtensionPermissionState {
 // ============================================================================
 
 export interface RpcSessionState {
+	/** Backend features used to reject incompatible desktop/backend combinations early. */
+	capabilities?: { mcpManagement?: boolean };
 	model?: ModelInfo;
 	thinkingLevel: ThinkingLevel;
 	isStreaming: boolean;
@@ -715,6 +734,7 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "set_model"; success: true; data: ModelInfo }
 	| { id?: string; type: "response"; command: "cycle_model"; success: true; data: { model: ModelInfo; thinkingLevel: ThinkingLevel; isScoped: boolean } | null }
 	| { id?: string; type: "response"; command: "get_available_models"; success: true; data: { models: ModelInfo[]; total: number } }
+	| { id?: string; type: "response"; command: "test_model"; success: true; data: ModelTestResult }
 
 	// Thinking
 	| { id?: string; type: "response"; command: "set_thinking_level"; success: true }
@@ -774,6 +794,7 @@ export type RpcResponse =
 	  }
 	| { id?: string; type: "response"; command: "delete_skill"; success: true; data: { name: string } }
 	| { id?: string; type: "response"; command: "install_skill"; success: true; data: { name: string; path: string } }
+	| { id?: string; type: "response"; command: "mcp_command"; success: true; data: { text: string } }
 	| { id?: string; type: "response"; command: "get_extensions"; success: true; data: { extensions: RpcExtensionInfo[] } }
 	| { id?: string; type: "response"; command: "get_extension_menus"; success: true; data: { menus: RpcExtensionMenu[] } }
 	| { id?: string; type: "response"; command: "get_themes"; success: true; data: { themes: RpcThemeInfo[] } }

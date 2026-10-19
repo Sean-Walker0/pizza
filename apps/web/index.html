@@ -4,6 +4,8 @@
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
 		<title>Pizza</title>
+		<link id="pizza-default-favicon" rel="icon" type="image/png" href="/pizza-icon.png" />
+		<link rel="apple-touch-icon" href="/pizza-icon.png" />
 		<script>
 			(function () {
 				// Theme hook: "boot" until the launch splash leaves (BootSplash.tsx).
@@ -19,6 +21,8 @@
 					if (saved && saved !== "light" && saved !== "dark") {
 						document.documentElement.dataset.theme = saved;
 					}
+					var defaultIcon = document.getElementById("pizza-default-favicon");
+					if (defaultIcon && mode === "dark") defaultIcon.href = "/pizza-icon-dark.png";
 					var css = localStorage.getItem("pizza-theme-css");
 					if (css) {
 						var style = document.createElement("style");
