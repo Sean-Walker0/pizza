@@ -31,13 +31,19 @@ describe.skipIf(!chromium)("browser engine integration (real chromium)", () => {
 		<a id="nav" href="/next">next page</a>
 		<div id="out"></div>
 		<div id="next-marker" style="display:none">next page loaded</div>
+		<div id="spinner" style="width:16px;height:16px;background:#39f;animation:spin 1s linear infinite"></div>
+		<style>@keyframes spin { to { transform: rotate(360deg); } }</style>
 		</body></html>`;
+	// Any response must keep the compositor producing frames (the spinner
+	// animation): headless Chromium — notably on Windows — may never emit an
+	// initial screencast frame for a fully static page, so tests that wait
+	// for a binary frame would hang.
 
 	beforeAll(async () => {
 		server = http.createServer((req, res) => {
 			res.writeHead(200, { "content-type": "text/html" });
 			if (req.url?.startsWith("/next")) {
-				res.end(`<!doctype html><html><body><div id="next-marker">next page loaded</div></body></html>`);
+				res.end(`<!doctype html><html><body><div id="next-marker">next page loaded</div><div id="spinner" style="width:16px;height:16px;background:#39f;animation:spin 1s linear infinite"></div><style>@keyframes spin { to { transform: rotate(360deg); } }</style></body></html>`);
 				return;
 			}
 			res.end(pageHtml);
@@ -55,7 +61,7 @@ describe.skipIf(!chromium)("browser engine integration (real chromium)", () => {
 		await controller.emergencyStop().catch(() => {});
 		await frameServer?.close().catch(() => {});
 		await new Promise<void>((resolve) => server.close(() => resolve()));
-	});
+	}, 30_000);
 
 	it("opens a local page and produces a ref-bearing ARIA snapshot", async () => {
 		const info = await controller.open(baseUrl, { source: "test" });
