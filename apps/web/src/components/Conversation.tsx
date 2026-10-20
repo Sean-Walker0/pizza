@@ -2,10 +2,12 @@ import { memo, useState, useEffect, useLayoutEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { cn } from "@/lib/utils";
 import { highlightText } from "@/lib/highlight";
+import { loadHljs } from "@/lib/hljs";
 import { INTERNAL_MESSAGE_KINDS, parseTellCommand, splitVoiceSegments, workspaceNameFrom, type AgentMessageInfo } from "@/lib/agent-messages";
 import { VoiceClipChip } from "./VoiceClip";
 import { CHANNEL_TYPES } from "@/lib/channels";
 import { Markdown } from "./Markdown";
+import { ConversationNav } from "./ConversationNav";
 import { Button, Badge } from "@/components/ui";
 import { FileAttachmentIcon } from "@/components/FileAttachmentIcon";
 import { formatFileSize } from "@/lib/file-format";
@@ -22,6 +24,7 @@ import {
 	ShieldAlert,
 	Waypoints,
 	ArrowUpRight,
+	ArrowDown,
 } from "lucide-react";
 
 export interface TimelineItem {
@@ -156,11 +159,30 @@ function useCopy(): [boolean, (text: string) => void] {
 	return [copied, copy];
 }
 
+/** Diff-shaped output (git diff, _edit previews) gets colored via hljs. */
+const DIFF_RE = /^(diff --git |@@ |--- |\+\+\+ )/m;
+
 /** Long monospace block that collapses to a preview by default. */
 function CollapsibleCode({ text, isError, highlight, highlightActive }: { text: string; isError?: boolean; highlight?: string; highlightActive?: boolean }) {
 	const { t } = useTranslation();
 	const [expanded, setExpanded] = useState(false);
+	const [highlighted, setHighlighted] = useState<{ source: string; html: string } | null>(null);
 	const { shown, clamped } = clampForDisplay(text, expanded);
+	// Colorize unified diffs (git diff, patch output); everything else stays
+	// plain so stdout noise never gets false colors. Search highlight wins.
+	const isDiff = !highlight && !isError && DIFF_RE.test(text) && shown.length < 100_000;
+	const html = isDiff && highlighted?.source === shown ? highlighted.html : null;
+	useEffect(() => {
+		if (!isDiff) {
+			setHighlighted(null);
+			return;
+		}
+		let cancelled = false;
+		void loadHljs()
+			.then((hljs) => { if (!cancelled) setHighlighted({ source: shown, html: hljs.highlight(shown, { language: "diff", ignoreIllegals: true }).value }); })
+			.catch(() => undefined);
+		return () => { cancelled = true; };
+	}, [shown, isDiff]);
 	return (
 		<div className="relative">
 			<pre
@@ -169,7 +191,11 @@ function CollapsibleCode({ text, isError, highlight, highlightActive }: { text: 
 					isError ? "text-danger" : "text-muted",
 				)}
 			>
-				{highlight ? highlightText(shown, highlight, highlightActive) : shown}
+				{html !== null ? (
+					<code className="hljs" dangerouslySetInnerHTML={{ __html: html }} />
+				) : (
+					highlight ? highlightText(shown, highlight, highlightActive) : shown
+				)}
 				{clamped && !expanded && <span className="text-muted/60">{"\n…"}</span>}
 			</pre>
 			{clamped && (
@@ -351,15 +377,31 @@ const ToolCard = memo(function ToolCard({
 	onResolveApproval,
 	highlight,
 	highlightActive,
+	/** True when the previous timeline row is also a tool card — tighten
+	 * the gap so a run of calls reads as one group. */
+	compact,
 }: {
 	item: TimelineItem;
 	onResolveApproval?: (intentEventId: string, toolCallId: string, approved: boolean) => void;
 	highlight?: string;
 	highlightActive?: boolean;
+	compact?: boolean;
 }) {
 	const { t } = useTranslation();
 	const [argsExpanded, setArgsExpanded] = useState(false);
-	const [collapsed, setCollapsed] = useState(false);
+	// Cards that load already finished (conversation history) start collapsed —
+	// the tool run is over, so they read as one quiet line like ChatGPT's
+	// used-tool rows. Pending approvals are excluded: they must stay visible.
+	const [collapsed, setCollapsed] = useState(
+		() => !item.streaming && item.pendingApproval?.status !== "pending",
+	);
+	// Once the user toggles a card by hand, auto-collapse must never fire —
+	// otherwise expanding a live card to watch it would be undone when it ends.
+	const userToggledRef = useRef(false);
+	const toggleCollapsed = () => {
+		userToggledRef.current = true;
+		setCollapsed((c) => !c);
+	};
 	const [copied, copy] = useCopy();
 	const command = formatToolArgs(item.toolArgs);
 	// Routed `_tell` commands get a dedicated header ("tell → <workspace>") so
@@ -367,20 +409,33 @@ const ToolCard = memo(function ToolCard({
 	const tellInfo = item.toolName === "cli" ? parseTellCommand(command) : null;
 	const tellToName = tellInfo?.to ? workspaceNameFrom(tellInfo.to) : undefined;
 	const { shown: commandShown, clamped: commandClamped } = clampForDisplay(command, argsExpanded);
+	const commandFirstLine = command.split("\n", 1)[0] ?? "";
 	const running = item.streaming && !item.toolResult;
 	const approval = item.pendingApproval;
 	const awaitingApproval = approval?.status === "pending";
+	// Auto-collapse the card the moment its run ends. Approval cards stay open:
+	// the user still has an action to take inside them.
+	useEffect(() => {
+		if (awaitingApproval) {
+			setCollapsed(false);
+		} else if (!running && !userToggledRef.current) {
+			setCollapsed(true);
+		}
+	}, [item.streaming, running, awaitingApproval]);
 	// Tool name + title are matched by search too; highlight them when active.
 	const toolTitle = highlight ? highlightText(item.toolName || item.title, highlight, highlightActive) : (item.toolName || item.title);
+	// A collapsed card with a multi-line command still needs a body: the
+	// header only shows the first line, so expanding is the only way to
+	// reach the rest. Single-line commands are fully visible in the header.
 	const hasBody = !!(
-		(command && (!collapsed || commandClamped)) ||
+		(command && (!collapsed || commandClamped || command.includes("\n"))) ||
 		approval ||
 		(item.toolImages && item.toolImages.length > 0) ||
 		item.toolResult ||
 		(running && !item.toolResult)
 	);
 	return (
-		<div className="my-4 flex justify-start">
+		<div className={cn("flex justify-start", compact ? "my-1" : "my-2")}>
 			<div
 				className={cn(
 					"w-full max-w-full overflow-hidden rounded-2xl border",
@@ -392,9 +447,9 @@ const ToolCard = memo(function ToolCard({
 						"flex items-center justify-between gap-3 px-3.5 py-2.5",
 						hasBody && "cursor-pointer select-none",
 					)}
-					onClick={() => hasBody && setCollapsed((c) => !c)}
+					onClick={() => hasBody && toggleCollapsed()}
 				>
-					<span className="flex items-center gap-2 text-[13px] font-medium text-fg">
+					<span className="flex min-w-0 max-w-[60%] items-center gap-2 text-[13px] font-medium text-fg">
 						{tellInfo ? (
 							<>
 								<Waypoints className="h-3.5 w-3.5 shrink-0 text-muted" />
@@ -416,11 +471,16 @@ const ToolCard = memo(function ToolCard({
 						) : (
 							<>
 								{awaitingApproval ? (
-									<ShieldAlert className="h-3.5 w-3.5 text-warning" />
+									<ShieldAlert className="h-3.5 w-3.5 shrink-0 text-warning" />
 								) : (
-									<Terminal className="h-3.5 w-3.5 text-muted" />
+									<Terminal className="h-3.5 w-3.5 shrink-0 text-muted" />
 								)}
-								{toolTitle}
+								<span className="shrink-0">{toolTitle}</span>
+								{commandFirstLine && (
+									<span className="min-w-0 truncate font-mono text-xs font-normal text-muted/70">
+										{commandFirstLine}
+									</span>
+								)}
 							</>
 						)}
 					</span>
@@ -468,7 +528,7 @@ const ToolCard = memo(function ToolCard({
 								type="button"
 								onClick={(e) => {
 									e.stopPropagation();
-									setCollapsed((c) => !c);
+									toggleCollapsed();
 								}}
 								className="flex h-6 w-6 items-center justify-center rounded-md text-muted/70 transition-colors hover:bg-surface-2 hover:text-fg"
 								title={collapsed ? t("conversation.showMore") : t("conversation.showLess")}
@@ -824,7 +884,7 @@ const AssistantMessage = memo(function AssistantMessage({ item, highlight, highl
 					</div>
 				)}
 				{item.text ? (
-					<Markdown highlight={highlight} highlightActive={highlightActive}>{item.text}</Markdown>
+					<Markdown streaming={item.streaming} highlight={highlight} highlightActive={highlightActive}>{item.text}</Markdown>
 				) : item.streaming ? (
 					<span className="inline-flex items-center gap-2 text-sm text-muted">
 						<Loader2 className="h-3.5 w-3.5 animate-spin text-accent" />
@@ -868,6 +928,7 @@ export function Conversation({
 	/** Item id of the currently-focused search match, for highlight + scroll. */
 	activeMatchId?: string | null;
 }) {
+	const { t } = useTranslation();
 	// When a search is active we must render every item (otherwise matches in
 	// the progressive-render tail wouldn't exist in the DOM to scroll to), so
 	// treat the list as fully rendered up-front. Searching a huge conversation
@@ -920,6 +981,9 @@ export function Conversation({
 	// (NOT by render cycles — the user can scroll between renders, and a stale
 	// render-time snapshot would wrongly pin or release the follow behavior).
 	const atBottomRef = useRef(true);
+	// Mirror of atBottomRef as state, solely to drive the jump-to-bottom
+	// button's visibility (the ref itself must stay event-driven).
+	const [atBottom, setAtBottom] = useState(true);
 	useEffect(() => {
 		const anchor = bottomAnchorRef.current;
 		if (!anchor) return;
@@ -936,7 +1000,9 @@ export function Conversation({
 		// to its heuristic anchor right after we set scrollTop — so disable it.
 		el.style.overflowAnchor = "none";
 		const onScroll = () => {
-			atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight <= FOLLOW_BOTTOM_THRESHOLD_PX;
+			const at = el.scrollHeight - el.scrollTop - el.clientHeight <= FOLLOW_BOTTOM_THRESHOLD_PX;
+			atBottomRef.current = at;
+			setAtBottom(at);
 		};
 		el.addEventListener("scroll", onScroll, { passive: true });
 		return () => el.removeEventListener("scroll", onScroll);
@@ -983,6 +1049,8 @@ export function Conversation({
 	//     scrollTop while content grows below it, so after submitting a
 	//     message the list appeared to stick in the middle instead of
 	//     showing the newest bubble.
+	const firstItemId = items[0]?.id ?? "";
+	const previousFirstIdRef = useRef(firstItemId);
 	const isFirstRenderRef = useRef(true);
 	const prevLenRef = useRef(items.length);
 	const prevLastIdRef = useRef("");
@@ -990,6 +1058,12 @@ export function Conversation({
 		const container = getScrollContainer();
 		if (!container) return;
 
+		if (previousFirstIdRef.current !== firstItemId) {
+			previousFirstIdRef.current = firstItemId;
+			isFirstRenderRef.current = true;
+			atBottomRef.current = true;
+			setAtBottom(true);
+		}
 		if (isFirstRenderRef.current) {
 			isFirstRenderRef.current = false;
 			preBatchScrollHeightRef.current = null;
@@ -1014,21 +1088,38 @@ export function Conversation({
 		// scrolling up to read history is never interrupted.
 		const lastItem = items[items.length - 1];
 		const appended = items.length !== prevLenRef.current || (lastItem?.id ?? "") !== prevLastIdRef.current;
-		if (appended && (atBottomRef.current || (lastItem?.role === "user" && !lastItem.agentMessage))) {
+		if (atBottomRef.current || (appended && lastItem?.role === "user" && !lastItem.agentMessage)) {
 			container.scrollTop = container.scrollHeight;
 		}
-	}, [items, renderCount]);
-
-	// Reset first-render flag when a full reload happens (workspace/session
-	// switch) so the new conversation gets an initial scroll-to-bottom.
-	const firstItemId = items.length > 0 ? items[0].id : "";
-	useEffect(() => {
-		isFirstRenderRef.current = true;
-	}, [firstItemId]);
+		prevLenRef.current = items.length;
+		prevLastIdRef.current = lastItem?.id ?? "";
+	}, [items, renderCount, firstItemId]);
 
 	// Refs to each rendered item wrapper, keyed by item id. Used to scroll the
 	// active search match into view.
 	const itemRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+
+	const [navigationTarget, setNavigationTarget] = useState<string | null>(null);
+	useLayoutEffect(() => {
+		if (!navigationTarget) return;
+		const element = itemRefs.current.get(navigationTarget);
+		const container = getScrollContainer();
+		if (element && container) {
+			element.scrollIntoView({ block: "start" });
+			container.scrollTop -= 24;
+			// content-visibility may replace estimated heights after revealing a
+			// distant turn. Correct once layout has settled before releasing it.
+			let attempts = 0;
+			const align = () => {
+				const delta = element.getBoundingClientRect().top - container.getBoundingClientRect().top - 24;
+				container.scrollTop += delta;
+				if (++attempts < 8) frame = requestAnimationFrame(align);
+				else setNavigationTarget(null);
+			};
+			let frame = requestAnimationFrame(align);
+			return () => cancelAnimationFrame(frame);
+		}
+	}, [navigationTarget, renderCount]);
 
 	// Scroll the active match into view (centered) whenever it changes. The
 	// element is guaranteed to exist because searching forces a full render.
@@ -1050,39 +1141,65 @@ export function Conversation({
 	const visibleItems = searching || renderCount >= items.length ? items : items.slice(items.length - renderCount);
 
 	return (
-		<div className="mx-auto max-w-3xl px-6 pb-32 pt-4">
-			{visibleItems.map((item) => {
-				const isActive = item.id === activeMatchId;
-				let content: React.ReactNode;
-				if (item.role === "user") {
-					content = item.agentMessage ? (
-						<AgentMessageCard item={item} highlight={searchQuery} highlightActive={isActive} />
-					) : (
-						<UserBubble item={item} highlight={searchQuery} highlightActive={isActive} />
+		<div>
+			<ConversationNav items={items} itemRefs={itemRefs} anchorRef={bottomAnchorRef} renderCount={renderCount} onNavigate={(id) => {
+				atBottomRef.current = false;
+				setAtBottom(false);
+				preBatchScrollHeightRef.current = null;
+				setRenderCount(items.length);
+				setNavigationTarget(id);
+			}} />
+			<div className={cn("mx-auto max-w-3xl pr-6 pb-32 pt-4", items.filter((item) => item.role === "user" && !item.agentMessage && !item.queued).length > 3 ? "pl-12 sm:pl-14" : "pl-6")}>
+				{visibleItems.map((item, i) => {
+					const isActive = item.id === activeMatchId;
+					let content: React.ReactNode;
+					if (item.role === "user") {
+						content = item.agentMessage ? (
+							<AgentMessageCard item={item} highlight={searchQuery} highlightActive={isActive} />
+						) : (
+							<UserBubble item={item} highlight={searchQuery} highlightActive={isActive} />
+						);
+					} else if (item.role === "system") {
+						content = <SystemNotice item={item} />;
+					} else if (item.role === "tool") {
+						content = <ToolCard item={item} compact={visibleItems[i - 1]?.role === "tool"} onResolveApproval={onResolveApproval} highlight={searchQuery} highlightActive={isActive} />;
+					} else if (!item.streaming && !item.text && !item.thinking && !(item.images && item.images.length > 0)) {
+						// Skip empty assistant bubbles (turns that produced only tool calls).
+						return null;
+					} else {
+						content = <AssistantMessage item={item} highlight={searchQuery} highlightActive={isActive} />;
+					}
+					return (
+						<div
+							key={item.id}
+							className="[content-visibility:auto] [contain-intrinsic-size:auto_180px]"
+							ref={(el) => {
+								if (el) itemRefs.current.set(item.id, el);
+								else itemRefs.current.delete(item.id);
+							}}
+						>
+							{content}
+						</div>
 					);
-				} else if (item.role === "system") {
-					content = <SystemNotice item={item} />;
-				} else if (item.role === "tool") {
-					content = <ToolCard item={item} onResolveApproval={onResolveApproval} highlight={searchQuery} highlightActive={isActive} />;
-				} else if (!item.streaming && !item.text && !item.thinking && !(item.images && item.images.length > 0)) {
-					// Skip empty assistant bubbles (turns that produced only tool calls).
-					return null;
-				} else {
-					content = <AssistantMessage item={item} highlight={searchQuery} highlightActive={isActive} />;
-				}
-				return (
-					<div
-						key={item.id}
-						ref={(el) => {
-							if (el) itemRefs.current.set(item.id, el);
-							else itemRefs.current.delete(item.id);
-						}}
-					>
-						{content}
+				})}
+				{!atBottom && (
+					<div className="pointer-events-none sticky bottom-4 z-10 -mb-9 flex justify-center">
+						<button
+							type="button"
+							onClick={() => {
+								const container = getScrollContainer();
+								container?.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
+							}}
+							className="pointer-events-auto flex items-center gap-1.5 rounded-full border border-border bg-surface px-3 py-1.5 text-xs text-muted shadow-md transition-colors hover:text-fg"
+							title={t("conversation.backToBottom")}
+						>
+							<ArrowDown className="h-3.5 w-3.5" />
+							{t("conversation.backToBottom")}
+						</button>
 					</div>
-				);
-			})}
-			<div ref={bottomAnchorRef} />
+				)}
+				<div ref={bottomAnchorRef} />
+			</div>
 		</div>
 	);
 }
