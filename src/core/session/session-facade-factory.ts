@@ -105,6 +105,8 @@ export interface CreateSessionFacadeOptions {
 
 	/** Override SQLite event database path (e.g. ":memory:" for tests). */
 	storagePath?: string;
+	/** Optional store; async backends must be opened before calling this factory. */
+	store?: import("../event-store/async-storage.js").SessionEventStore;
 	/** Override workspace id when opening a session from another workspace. */
 	workspaceId?: string;
 	/** Existing projection session id to activate before prompting. */
@@ -233,19 +235,30 @@ export async function createSessionFacade(
 	const modelFallbackMessage = resolution.modelFallbackMessage;
 
 	// ── EventStore + projection SessionManager ─────────────────────────────
-	const { store, sessionManager, workspaceLock, workspaceId } = setupEventStore({
-		cwd,
-		agentDir,
-		rawAgentDir: options.agentDir,
-		isMainAgent,
-		workspaceId: options.workspaceId,
-		storagePath: options.storagePath,
-		sessionId: options.sessionId,
-		threadId: options.threadId,
-		forkFrom: options.forkFrom,
-	});
+	// The facade owns an injected store: close it if setup itself fails.
+	let setup: ReturnType<typeof setupEventStore>;
+	try {
+		setup = setupEventStore({
+			cwd,
+			agentDir,
+			rawAgentDir: options.agentDir,
+			isMainAgent,
+			workspaceId: options.workspaceId,
+			storagePath: options.storagePath,
+			store: options.store,
+			sessionId: options.sessionId,
+			threadId: options.threadId,
+			forkFrom: options.forkFrom,
+		});
+	} catch (error) {
+		if (options.store) await closeStoreQuietly(options.store);
+		throw error;
+	}
+	const { store, sessionManager, workspaceLock, workspaceId } = setup;
+	let facade: SessionFacade | undefined;
+	try {
 	const eventStorePath =
-		options.storagePath === ":memory:"
+		options.store || options.storagePath === ":memory:"
 			? undefined
 			: (options.storagePath ?? getEventDatabasePath(workspaceId, agentDir));
 
@@ -423,6 +436,9 @@ export async function createSessionFacade(
 						requestApproval: () => {},
 						cancelApproval: () => {},
 					},
+		// Extension `tool_call` handlers are enforced before execution: a
+		// `{ block: true }` result (or a throwing handler) rejects the call.
+		beforeToolCall: extensionRunner.createToolCallGate(),
 		retryAssistantErrorCompletions: true,
 		retryPolicy: new DefaultRetryPolicy({ capDelayMs: settingsManager.getRetrySettings().maxDelayMs }),
 		contextBudget: options.contextBudget ?? model?.contextWindow ?? 128000,
@@ -467,7 +483,7 @@ export async function createSessionFacade(
 	const extensionEventUnsubscribe = extensionRunner.bindEventStore(store);
 	await extensionRunner.emit(options.sessionStartEvent ?? { type: "session_start", reason: "startup" });
 
-	const facade = new SessionFacade({
+	facade = new SessionFacade({
 		runtime,
 		settingsManager,
 		modelRegistry,
@@ -476,6 +492,7 @@ export async function createSessionFacade(
 		disposers: workspaceLock ? [extensionEventUnsubscribe, workspaceLock.release] : [extensionEventUnsubscribe],
 	});
 
+	if (store.flush) await store.flush();
 	return {
 		facade,
 		runtime,
@@ -495,4 +512,23 @@ export async function createSessionFacade(
 			return true;
 		},
 	};
+	} catch (error) {
+		// Cleanup must never mask the original failure.
+		if (facade) {
+			await facade.disposeAsync().catch(() => {});
+		} else {
+			await closeStoreQuietly(store);
+			workspaceLock?.release();
+		}
+		throw error;
+	}
+}
+
+async function closeStoreQuietly(store: import("../event-store/async-storage.js").SessionEventStore): Promise<void> {
+	try {
+		if (store.closeAsync) await store.closeAsync();
+		else store.close?.();
+	} catch {
+		/* best effort */
+	}
 }

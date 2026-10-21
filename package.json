@@ -1,6 +1,6 @@
 {
 	"name": "@tomsun28/pizza",
-	"version": "0.4.2",
+	"version": "0.4.3",
 	"description": "Pizza - Pizza is an event-driven agent. Every conversation, tool call, and file edit is an event in an immutable log. Your UI, the LLM context, and the session tree are all projections of that log.",
 	"type": "module",
 	"pizzaConfig": {
@@ -59,6 +59,7 @@
 		"test": "cross-env PIZZA_OFFLINE=1 vitest --run --no-file-parallelism --poolOptions.forks.singleFork",
 		"test:headless": "cross-env PIZZA_OFFLINE=1 vitest --run --no-file-parallelism --poolOptions.forks.singleFork",
 		"test:online": "vitest --run",
+		"test:pg": "cross-env PIZZA_OFFLINE=1 vitest --run test/postgres-storage.integration.test.ts",
 		"install:local": "npm run build && npm link",
 		"prepublishOnly": "npm run clean && npm run build && npm run vendor-tools"
 	},
@@ -100,6 +101,14 @@
 			"rimraf": "6.1.2"
 		}
 	},
+	"peerDependencies": {
+		"pg": "^8.11.0"
+	},
+	"peerDependenciesMeta": {
+		"pg": {
+			"optional": true
+		}
+	},
 	"optionalDependencies": {
 		"@mariozechner/clipboard": "^0.3.2"
 	},
@@ -108,10 +117,12 @@
 		"@types/hosted-git-info": "^3.0.5",
 		"@types/ms": "^2.1.0",
 		"@types/node": "^24.3.0",
+		"@types/pg": "^8.23.1",
 		"@types/proper-lockfile": "^4.1.4",
 		"@types/ws": "^8.5.13",
 		"@typescript/native-preview": "^7.0.0-dev.20260120.1",
 		"cross-env": "^10.1.0",
+		"pg": "^8.23.1",
 		"shx": "^0.4.0",
 		"tsx": "^4.21.0",
 		"typescript": "^5.7.3",
@@ -132,6 +143,6 @@
 		"url": "https://github.com/pizza-agent/pizza.git"
 	},
 	"engines": {
-		"node": ">=22.5.0"
+		"node": ">=22.13.0"
 	}
 }

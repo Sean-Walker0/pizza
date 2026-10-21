@@ -57,6 +57,15 @@ import { DefaultRetryPolicy, NoopCompactionPolicy } from "./policies.js";
 // Types
 // ============================================================================
 
+export interface ToolCallGateInput {
+	tool_call_id: string;
+	tool_name: string;
+	arguments: Record<string, unknown>;
+}
+export type ToolCallGate = (
+	call: ToolCallGateInput,
+) => Promise<{ block?: boolean; reason?: string } | undefined | void>;
+
 /** Reactor configuration */
 export interface ReactorConfig {
 	/** Shared turn-level state (follow-ups, retries, trackers, approvals).
@@ -69,6 +78,11 @@ export interface ReactorConfig {
 	classifier: IntentClassifier;
 	toolRegistry: ToolRegistry;
 	approvalHandler?: ApprovalHandler;
+	/** Authoritative pre-execution gate (e.g. extension `tool_call` handlers).
+	 * Runs after approval and before TOOL_EXECUTION_START. It receives a private
+	 * copy of the arguments; in-place mutations are what the tool executes.
+	 * Returning `{ block: true }` or throwing rejects the call (fail closed). */
+	beforeToolCall?: ToolCallGate;
 	runtimeAdapter: RuntimeAdapter;
 	systemPrompt: string;
 	model: { provider: string; model_id: string; thinking_level?: string };
@@ -345,6 +359,8 @@ export class Reactor {
 		try {
 			await handler(event);
 		} catch (err) {
+			// A persistence failure already rejects the prompt; never append recursively to a failed store.
+			try { if (this.config.store.flush) await this.config.store.flush(); } catch { return; }
 			// Emit as RUNTIME_ERROR instead of throwing — the reactor must keep running
 			const msg = err instanceof Error ? err.message : String(err);
 			this._emit({
@@ -766,6 +782,9 @@ export class Reactor {
 		});
 
 		try {
+			// Durability barrier before the external call. Kept outside the
+			// stream-idle watchdog so slow commits never count as a stalled stream.
+			if (this.config.store.flush) await this.config.store.flush();
 			// Start the stream-idle watchdog. It fires if no chunk arrives
 			// within the timeout window, aborting the hung LLM call so the
 			// reactor emits LLM_CALL_FAILED instead of hanging forever.
@@ -1088,8 +1107,32 @@ export class Reactor {
 			}
 		}
 
+		// Private copy: gate mutations must not leak into the logged intent event.
+		const args = structuredClone(payload.arguments ?? {});
+		if (this.config.beforeToolCall) {
+			let decision: { block?: boolean; reason?: string } | undefined | void;
+			try {
+				decision = await this.config.beforeToolCall({
+					tool_call_id: payload.tool_call_id,
+					tool_name: payload.tool_name,
+					arguments: args,
+				});
+			} catch (err) {
+				decision = { block: true, reason: `tool_call hook failed: ${err instanceof Error ? err.message : String(err)}` };
+			}
+			if (decision?.block) {
+				const reason = decision.reason?.trim() || "Blocked by tool_call hook";
+				this._emitToolExecutionRejected(payload.tool_call_id, payload.tool_name, {
+					content: [{ type: "text", text: `Tool execution blocked: ${reason}` }],
+					is_error: true,
+					error_message: reason,
+				}, event.event_id);
+				return;
+			}
+		}
+
 		// Execute the tool
-		await this._executeTool(event.event_id, payload.tool_call_id, payload.tool_name, payload.arguments);
+		await this._executeTool(event.event_id, payload.tool_call_id, payload.tool_name, args);
 	}
 
 	private async _executeTool(causedBy: string, tool_call_id: string, tool_name: string, args: Record<string, unknown>): Promise<void> {
@@ -1103,6 +1146,7 @@ export class Reactor {
 		});
 
 		try {
+			if (this.config.store.flush) await this.config.store.flush();
 			const result = await this.config.runtimeAdapter.executeTool({
 				tool_call_id,
 				tool_name,
