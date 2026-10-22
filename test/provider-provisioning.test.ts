@@ -95,8 +95,11 @@ describe("provider provisioning target", () => {
 			defaultModel: "model-a",
 			defaultThinkingLevel: "high",
 		});
-		for (const file of ["auth.json", "models.json", "settings.json"]) {
-			expect((await stat(join(agentDir, file))).mode & 0o777).toBe(0o600);
+		if (process.platform !== "win32") {
+			// Windows does not expose POSIX permission bits through fs.stat().
+			for (const file of ["auth.json", "models.json", "settings.json"]) {
+				expect((await stat(join(agentDir, file))).mode & 0o777).toBe(0o600);
+			}
 		}
 
 		const replay = await applyProviderProvisioningEnvelope(envelope(), { agentDir });
